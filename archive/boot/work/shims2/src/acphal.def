@@ -1,0 +1,11 @@
+LIBRARY AcpHal
+EXPORTS
+    AcpHalAllocateShapeContexts
+    AcpHalCreate
+    AcpHalReleaseShapeContexts
+    ApuAlloc
+    ApuCreateHeap
+    ApuFree
+    ApuIsVirtualAddressValid
+    ApuMapApuAddress
+    ApuMapVirtualAddress
