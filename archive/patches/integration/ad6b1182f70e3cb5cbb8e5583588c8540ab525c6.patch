@@ -1,0 +1,256 @@
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 4c27bf19e..b0926edb2 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -816,6 +816,7 @@ struct DeviceState {
+                      entry.fssm_sha256.c_str());
+     }
+ 
++
+     bool depth_usable(VkFormat format) const {
+         VkFormatProperties properties{};
+         format_properties(info.physical, format, &properties);
+@@ -4869,6 +4870,31 @@ struct OwnedRuntime {
+     VkInstance instance = VK_NULL_HANDLE;
+ };
+ 
++// LEONIDA_XS_TRACE_CALLS=1: one line per resource creation with its description, its result and the pointer the
++// caller got. The detail lines beside the checks are log_once, so a repeated creation of the same shape leaves no
++// trace and a caller that stored null cannot be matched to the creation that returned it.
++bool creation_trace_enabled() {
++    static const bool enabled = [] {
++        char value[8] = {};
++        const DWORD length = GetEnvironmentVariableA("LEONIDA_XS_TRACE_CALLS", value, sizeof(value));
++        return length > 0 && value[0] != '\0' && value[0] != '0';
++    }();
++    return enabled;
++}
++
++void trace_creation(const char* method, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, HRESULT hr,
++                    const void* out) {
++    if (!creation_trace_enabled()) return;
++    static std::atomic<std::uint64_t> calls{0};
++    const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
++    std::fprintf(stderr,
++                 "[trace] create #%llu %s dim=%d %llux%u fmt=%u mips=%u array=%u flags=0x%x state=0x%x "
++                 "-> hr=0x%08lx out=%p\n",
++                 static_cast<unsigned long long>(call), method ? method : "internal", int(desc.Dimension),
++                 static_cast<unsigned long long>(desc.Width), desc.Height, unsigned(desc.Format), desc.MipLevels,
++                 desc.DepthOrArraySize, unsigned(desc.Flags), unsigned(state), static_cast<unsigned long>(hr), out);
++}
++
+ class Device final
+     : public Object<Device, ID3D12Device11Stubs, ID3D12Object, ID3D12Device, ID3D12Device1, ID3D12Device2,
+                     ID3D12Device3, ID3D12Device4, ID3D12Device5, ID3D12Device6, ID3D12Device7, ID3D12Device8,
+@@ -7121,9 +7147,12 @@ public:
+         }
+         if (FAILED(hr)) {
+             resource->Release();
++            trace_creation(method, *desc, initial, hr, nullptr);
+             return d3d12_trace::result(method, hr);
+         }
+-        return d3d12_trace::result(method, hand_out(resource, riid, out));
++        const HRESULT placed = hand_out(resource, riid, out);
++        trace_creation(method, *desc, initial, placed, out ? *out : nullptr);
++        return d3d12_trace::result(method, placed);
+     }
+ 
+     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
+@@ -8175,6 +8204,7 @@ private:
+             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
+                          .c_str(),
+                      int(desc->Dimension));
++            trace_creation(method, *desc, initial, E_INVALIDARG, nullptr);
+             return finish(E_INVALIDARG);
+         }
+         // The sample quality is checked above as the host does it here: CreateCommittedResource accepts a quality on a
+@@ -8186,9 +8216,11 @@ private:
+                       " refused (texture size, mips, samples or alignment), dimension")
+                          .c_str(),
+                      int(desc->Dimension));
++            trace_creation(method, *desc, initial, E_INVALIDARG, nullptr);
+             return finish(E_INVALIDARG);
+         }
+         const HRESULT created = finish(create_committed(heap, heap_flags, desc, initial, castable_count, castable, riid, out));
++        trace_creation(method, *desc, initial, created, out ? *out : nullptr);
+         if (FAILED(created))
+             log_once((std::string(method ? method : "CreateCommittedResource") + " creation failed, state").c_str(),
+                      int(initial));
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 5b8735abb..1fa7a88c8 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -393,6 +393,109 @@ std::uint64_t hr_to_u64(HRESULT hr) {
+     return static_cast<std::uint64_t>(static_cast<std::uint32_t>(hr));
+ }
+ 
++// LEONIDA_XS_TRACE_CALLS=1: one line per device-slot call carrying the guest return address, the first four
++// arguments and the value that went back. The boot log otherwise only announces a slot's first call, so a null a
++// caller stores cannot be tied to the call that produced it; with this the caller's own instruction is named.
++bool call_trace_enabled() {
++    static const bool enabled = [] {
++        char value[8] = {};
++        const DWORD length = GetEnvironmentVariableA("LEONIDA_XS_TRACE_CALLS", value, sizeof(value));
++        return length > 0 && value[0] != '\0' && value[0] != '0';
++    }();
++    return enabled;
++}
++
++// The guest image is mapped at its `ImageBase` (the loader's trace records base 0x140000000, relocated false), so an
++// RVA is the return address less that base. LEONIDA_XS_TRACE_BASE overrides it for a run that is relocated.
++std::uint64_t guest_image_base() {
++    static const std::uint64_t base = [] {
++        char value[32] = {};
++        const DWORD length = GetEnvironmentVariableA("LEONIDA_XS_TRACE_BASE", value, sizeof(value));
++        if (length > 0) {
++            errno = 0;
++            char* end = nullptr;
++            const std::uint64_t parsed = std::strtoull(value, &end, 0);
++            if (errno == 0 && end != value) return parsed;
++        }
++        return std::uint64_t{0x140000000};
++    }();
++    return base;
++}
++
++void trace_device_call(unsigned slot, const void* caller, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
++                       std::uint64_t a4, std::uint64_t result) {
++    const std::uint64_t address = reinterpret_cast<std::uint64_t>(caller);
++    const std::uint64_t base = guest_image_base();
++    std::fprintf(stderr,
++                 "[trace] tid %lu device %u from %#llx (+%#llx) args %#llx %#llx %#llx %#llx -> %#llx\n",
++                 static_cast<unsigned long>(GetCurrentThreadId()), slot, static_cast<unsigned long long>(address),
++                 static_cast<unsigned long long>(address >= base ? address - base : address),
++                 static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
++                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
++                 static_cast<unsigned long long>(result));
++}
++
++// LEONIDA_XS_TRACE_CALLS: an allocation query's description and the size/alignment that went back. A caller that
++// turns the answer into an allocation fails later and somewhere else, so the two have to be read together.
++void trace_allocation_answer(unsigned slot, const D3D12_RESOURCE_DESC* desc, std::uint64_t size,
++                             std::uint64_t alignment) {
++    if (!call_trace_enabled() || !desc) return;
++    std::fprintf(stderr,
++                 "[trace] alloc%u dim=%d %llux%u fmt=%u mips=%u array=%u flags=0x%x layout=0x%x -> size=%#llx "
++                 "align=%#llx\n",
++                 slot, int(desc->Dimension), static_cast<unsigned long long>(desc->Width), desc->Height,
++                 unsigned(desc->Format), desc->MipLevels, desc->DepthOrArraySize, unsigned(desc->Flags),
++                 unsigned(desc->Layout), static_cast<unsigned long long>(size),
++                 static_cast<unsigned long long>(alignment));
++}
++
++// LEONIDA_XS_TRACE_DUMP="0x149e1dac0:3,0x14a943ac0:1": guest addresses, and how many 8-byte words of each, printed
++// with every traced device call. The title keeps the state behind a null in its own globals, so the only way to see it
++// is to read it; the addresses are this package's, so the list is an environment variable and not a constant.
++struct TraceDumpWord {
++    std::uint64_t address;
++    unsigned count;
++};
++
++const std::vector<TraceDumpWord>& trace_dump_words() {
++    static const std::vector<TraceDumpWord> words = [] {
++        std::vector<TraceDumpWord> parsed;
++        char value[512] = {};
++        const DWORD length = GetEnvironmentVariableA("LEONIDA_XS_TRACE_DUMP", value, sizeof(value));
++        if (length == 0) return parsed;
++        const char* at = value;
++        while (*at && parsed.size() < 8) {
++            errno = 0;
++            char* end = nullptr;
++            const std::uint64_t address = std::strtoull(at, &end, 0);
++            if (end == at) break;
++            unsigned count = 1;
++            if (*end == ':') {
++                at = end + 1;
++                const unsigned long parsed_count = std::strtoul(at, &end, 0);
++                if (errno == 0 && parsed_count > 0 && parsed_count <= 16) count = static_cast<unsigned>(parsed_count);
++            }
++            parsed.push_back({address, count});
++            while (*end == ',' || *end == ' ') ++end;
++            if (*end == '\0') break;
++            at = end;
++        }
++        return parsed;
++    }();
++    return words;
++}
++
++void trace_dump_state() {
++    const std::vector<TraceDumpWord>& words = trace_dump_words();
++    for (const TraceDumpWord& word : words) {
++        std::fprintf(stderr, "[trace] state[%#llx]:", static_cast<unsigned long long>(word.address));
++        const auto* base = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(word.address));
++        for (unsigned i = 0; i < word.count; ++i)
++            std::fprintf(stderr, " %#llx", static_cast<unsigned long long>(base[i]));
++        std::fprintf(stderr, "\n");
++    }
++}
++
+ unsigned long proxy_add_ref(DeviceProxy* self) {
+     note_slot(1);
+     return self->refs.fetch_add(1, std::memory_order_relaxed) + 1;
+@@ -2843,6 +2946,7 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
+     }
+     *ret = device8->GetResourceAllocationInfo2(visible_mask, count, descs_to_pass, info1);
+     device8->Release();
++    trace_allocation_answer(108, raw_descs, ret->SizeInBytes, ret->Alignment);
+     return reinterpret_cast<std::uint64_t>(ret);
+ }
+ 
+@@ -2865,6 +2969,7 @@ D3D12_RESOURCE_ALLOCATION_INFO* proxy_get_resource_allocation_info(D3D12_RESOURC
+                      static_cast<const void*>(descs));
+     if (!out) return nullptr;
+     *out = self->real->GetResourceAllocationInfo(node_mask, count, descs);
++    if (count == 1) trace_allocation_answer(25, descs, out->SizeInBytes, out->Alignment);
+     return out;
+ }
+ 
+@@ -3071,10 +3176,10 @@ bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1,
+ }
+ 
+ template <unsigned Slot>
+-std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+-                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+-                                std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
+-                                std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
++std::uint64_t WINAPI proxy_slot_impl(DeviceProxy* self, const void* caller, std::uint64_t a1, std::uint64_t a2,
++                                     std::uint64_t a3, std::uint64_t a4, std::uint64_t a5, std::uint64_t a6,
++                                     std::uint64_t a7, std::uint64_t a8, std::uint64_t a9, std::uint64_t a10,
++                                     std::uint64_t a11, std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
+     if constexpr (Slot == 0) {
+         return hr_to_u64(proxy_query_interface(self, reinterpret_cast<const IID*>(a1),
+                                                reinterpret_cast<void**>(a2)));
+@@ -3155,7 +3260,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+             reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self), reinterpret_cast<DeviceProxy*>(a1),
+             static_cast<UINT>(a2), static_cast<UINT>(a3), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4)));
+     } else if constexpr (Slot == 61) {
+-        if (is_console_caller(_ReturnAddress())) {
++        if (is_console_caller(caller)) {
+             proxy_create_sampler_x(self, reinterpret_cast<const void*>(a1),
+                                    D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
+             return 0;
+@@ -3254,6 +3359,23 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+     }
+ }
+ 
++// The vtable entry the guest calls. Always the shape above; with LEONIDA_XS_TRACE_CALLS it also records the caller
++// and the value, which is the only place the guest's own instruction is still known.
++template <unsigned Slot>
++std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
++                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
++                                std::uint64_t a8, std::uint64_t a9, std::uint64_t a10, std::uint64_t a11,
++                                std::uint64_t a12, std::uint64_t a13, std::uint64_t a14) {
++    const void* caller = _ReturnAddress();
++    const std::uint64_t result = proxy_slot_impl<Slot>(self, caller, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
++                                                       a12, a13, a14);
++    if (call_trace_enabled()) {
++        trace_device_call(Slot, caller, a1, a2, a3, a4, result);
++        if constexpr (Slot == 25 || Slot == 76 || Slot == 108 || Slot == 127 || Slot == 133) trace_dump_state();
++    }
++    return result;
++}
++
+ template <std::size_t... I>
+ void fill_vtable(void** vtable, std::index_sequence<I...>) {
+     ((vtable[I] = reinterpret_cast<void*>(&proxy_slot<static_cast<unsigned>(I)>) ), ...);
