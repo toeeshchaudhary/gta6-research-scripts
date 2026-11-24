@@ -1,0 +1,277 @@
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index e17a80353b..93c0af38a7 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -44,7 +44,10 @@
+ namespace rt::d3d12_xs {
+ namespace {
+ 
+-constexpr unsigned kMaxSlots = 128;
++// The retail title calls device slots well past ID3D12Device14 (slot 133 at least); every slot past the PC device's
++// vtable goes through the generic thunk and is refused with E_NOTIMPL, so the table must outlast the highest one.
++constexpr unsigned kMaxSlots = 192;
++static_assert(kMaxSlots > 133, "the proxy table must cover the slots the retail title calls (up to 133)");
+ static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
+ static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
+ static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
+@@ -143,6 +146,7 @@ const char* slot_name(unsigned slot) {
+         case 67: return "Xbox DeserializeComputePipelineStateX";
+         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
+         case 75: return "CreateCommandQueue1 -> queue proxy";
++        case 133: return "Xbox CreatePlacedResourceX -> committed resource";
+         case 76: return "Xbox resource creation";
+         case 78: return "Xbox SetFrameIntervalX";
+         case 79: return "Xbox ScheduleFrameEventX";
+@@ -1480,6 +1484,48 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
+                                                *riid, out);
+ }
+ 
++// Device slot 133 places a resource at a virtual address: (va, desc, initial_state, clear_value, riid, out), the
++// shape of the console's CreatePlacedResourceX. Measured locally at a title's call sites: riid is ID3D12Resource, va is
++// the start of a range the title has just reserved for physical pages, desc is a 56-byte D3D12_RESOURCE_DESC with
++// Xbox bits in Flags above the PC flags, and initial_state is all ones, which is no PC state. The PC has no call that
++// puts a resource at a caller's address, so this creates a committed DEFAULT-heap resource from the cleaned
++// description: the PC flags only, slot 76's layout rule, COMMON for a buffer or an all-ones state, and the clear value
++// only for a render target or depth texture. The resource is not backed by the memory at va: what the title writes
++// there does not reach it. Backing it needs the physical-page mapper; until then this gets the title past the call.
++constexpr std::uint32_t kPcResourceFlags = 0x3FF;  // D3D12_RESOURCE_FLAG_* up to USE_TIGHT_ALIGNMENT (0x200)
++
++HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t va, const D3D12_RESOURCE_DESC* xbox_desc,
++                                       std::uint32_t initial_state, const D3D12_CLEAR_VALUE* clear_value,
++                                       const IID* riid, void** out) {
++    note_slot(133);
++    if (out) *out = nullptr;
++    if (!xbox_desc) return E_INVALIDARG;
++    if (!riid || !out) return E_POINTER;
++
++    D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
++    const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
++    pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
++    const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
++    pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    const auto state = (buffer || initial_state == 0xFFFFFFFFu) ? D3D12_RESOURCE_STATE_COMMON
++                                                                 : static_cast<D3D12_RESOURCE_STATES>(initial_state);
++    const bool clearable =
++        !buffer && (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
++
++    static std::atomic<bool> logged{false};
++    if (first_call(logged))
++        std::fprintf(stderr,
++                     "[rt] d3d12_xs: slot 133 places a resource at a VA: dimension=%d flags=0x%x -> 0x%x, state=0x%x; "
++                     "created committed, not backed by the VA\n",
++                     static_cast<int>(pc_desc.Dimension), xbox_flags, static_cast<unsigned>(pc_desc.Flags),
++                     initial_state);
++    (void)va;
++    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
++                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
++    return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
++                                               clearable ? clear_value : nullptr, *riid, out);
++}
++
+ template <unsigned Slot>
+ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+@@ -1521,6 +1567,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
+             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
+             reinterpret_cast<void**>(a3)));
++    } else if constexpr (Slot == 133) {
++        return hr_to_u64(proxy_create_placed_resource_x(
++            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2), static_cast<std::uint32_t>(a3),
++            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
++            reinterpret_cast<void**>(a6)));
+     } else if constexpr (Slot == 76) {
+         return hr_to_u64(proxy_create_resource(
+             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
+@@ -1706,7 +1757,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ bool device_slot_overridden(unsigned slot) {
+     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+         slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+-        slot == 75 || slot == 76)
++        slot == 75 || slot == 76 || slot == 133)
+         return true;
+     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 0019ec5069..1451d67fcf 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -7,6 +7,8 @@
+ //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
+ //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
+ //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
++//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
++//             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
+ //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
+ //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
+ //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index f0030116bd..da3e71f0ca 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -246,6 +246,38 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
+     return mock_query(child, riid, out);
+ }
+ 
++// PC ID3D12Device::CreateCommittedResource (slot 27) takes seven words after `this`, so it has its own entry too. It
++// records what it was given (the description by value) and makes a resource mock.
++struct CommittedCall {
++    D3D12_HEAP_PROPERTIES heap;
++    D3D12_HEAP_FLAGS heap_flags;
++    D3D12_RESOURCE_DESC desc;
++    D3D12_RESOURCE_STATES state;
++    const D3D12_CLEAR_VALUE* clear;
++    const IID* riid;
++};
++CommittedCall g_committed{};
++
++HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPERTIES* heap,
++                                              D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* desc,
++                                              D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
++                                              const IID* riid, void** out) {
++    ++self->calls[27];
++    g_committed = CommittedCall{};
++    if (heap) g_committed.heap = *heap;
++    g_committed.heap_flags = heap_flags;
++    if (desc) g_committed.desc = *desc;
++    g_committed.state = state;
++    g_committed.clear = clear;
++    g_committed.riid = riid;
++    if (!out) return S_FALSE;
++    *out = nullptr;
++    if (self->create_null || FAILED(self->create_result)) return self->create_result;
++    Mock* child = new_mock(Kind::resource);
++    self->last_child = child;
++    return mock_query(child, riid, out);
++}
++
+ template <std::size_t... I>
+ void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
+     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
+@@ -256,6 +288,7 @@ void** mock_vtable() {
+     static const bool filled = [] {
+         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
+         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
++        table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
+         return true;
+     }();
+     (void)filled;
+@@ -275,6 +308,14 @@ std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::
+                                                   0, 0, 0);
+ }
+ 
++// The same with a sixth word, the first stack argument (slot 133's output pointer).
++std::uint64_t raw6(const void* object, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
++                   std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
++    void* const* vtable = *reinterpret_cast<void* const* const*>(object);
++    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
++                                                  0, 0, 0);
++}
++
+ HRESULT hr_of(std::uint64_t value) {
+     return static_cast<HRESULT>(static_cast<std::uint32_t>(value));
+ }
+@@ -381,6 +422,10 @@ int check_levels() {
+             EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
+         }
+ 
++        // 134: past every PC device vtable and not handled by the proxy (133 is, see check_placed_resource_x).
++        // Refused, not a jump through a missing entry.
++        EXPECT(hr_of(raw(device, 134)) == E_NOTIMPL && mock->calls[127] == 0);
++
+         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
+         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
+         EXPECT(release(queue) == 0 && release(fence) == 0);
+@@ -687,6 +732,84 @@ int check_allocators() {
+     return 0;
+ }
+ 
++// ---- 6b. Device slot 133: a resource placed at a VA becomes a committed DEFAULT-heap resource ----
++//
++// The device stops at ID3D12Device9 (76 slots), so 133 is past its table: the proxy must answer it before the
++// beyond-table refusal and reach the PC CreateCommittedResource (slot 27) with a cleaned description.
++int check_placed_resource_x() {
++    Mock* mock = nullptr;
++    void* device = make_device(mock, 9, true);
++    EXPECT(device && xs::device_slot_overridden(133));
++    xs::reset_device_proxy_stats();
++    constexpr std::uint64_t kVa = 0x7f0000000000ull;  // any address: the stand-in does not touch it
++    constexpr auto kXboxFlag = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);  // a bit above every PC flag
++
++    // A buffer with an Xbox flag bit, a non-PC layout word and the all-ones state: PC flags only, ROW_MAJOR, COMMON,
++    // no clear value, DEFAULT heap, and the caller's IID.
++    D3D12_RESOURCE_DESC buffer{};
++    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    buffer.Width = 1 << 20;
++    buffer.Height = 1;
++    buffer.DepthOrArraySize = 1;
++    buffer.MipLevels = 1;
++    buffer.SampleDesc.Count = 1;
++    buffer.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
++    buffer.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | kXboxFlag);
++    const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {{0, 0, 0, 1}}};
++    void* resource = nullptr;
++    EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0xFFFFFFFFu, word(&clear), word(&kResourceIid),
++                      word(&resource))) == S_OK);
++    EXPECT(resource && reinterpret_cast<Mock*>(resource)->kind == Kind::resource);
++    EXPECT(mock->calls[27] == 1 && mock->calls[127] == 0 && xs::device_slot_hits(133) == 1);
++    EXPECT(g_committed.heap.Type == D3D12_HEAP_TYPE_DEFAULT && g_committed.heap_flags == D3D12_HEAP_FLAG_NONE);
++    EXPECT(g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
++    EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && g_committed.desc.Width == buffer.Width);
++    EXPECT(g_committed.state == D3D12_RESOURCE_STATE_COMMON && !g_committed.clear);
++    EXPECT(g_committed.riid == &kResourceIid);
++    EXPECT(release(resource) == 0);
++
++    // A render-target texture in a PC state keeps the state and its clear value; the layout becomes UNKNOWN.
++    D3D12_RESOURCE_DESC target = buffer;
++    target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    target.Width = 64;
++    target.Height = 32;
++    target.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    target.Flags = static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | kXboxFlag);
++    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), D3D12_RESOURCE_STATE_RENDER_TARGET, word(&clear),
++                      word(&kResourceIid), word(&resource))) == S_OK);
++    EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
++    EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
++    EXPECT(g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
++    EXPECT(release(resource) == 0);
++    // The same texture in the all-ones state is created in COMMON.
++    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource))) ==
++           S_OK);
++    EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
++    EXPECT(release(resource) == 0);
++
++    // Refusals before the device is called; the output is cleared.
++    resource = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw6(device, 133, kVa, 0, 0, 0, word(&kResourceIid), word(&resource))) == E_INVALIDARG);
++    EXPECT(!resource);
++    resource = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, 0, word(&resource))) == E_POINTER && !resource);
++    EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), 0)) == E_POINTER);
++    EXPECT(mock->calls[27] == 3);
++
++    // A failed creation is returned as it is, with no object.
++    mock->create_result = E_OUTOFMEMORY;
++    resource = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), word(&resource))) ==
++           E_OUTOFMEMORY);
++    EXPECT(!resource && mock->calls[27] == 4);
++    mock->create_result = S_OK;
++
++    EXPECT(release(device) == 0 && mock->refs == 0);
++    std::printf("%s: device slot 133 places a resource as a committed DEFAULT one (PC flags, COMMON for all-ones, "
++                "clear value for targets only), past a 76-slot device\n", g_label);
++    return 0;
++}
++
+ // ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) ----
+ //
+ // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
+@@ -950,6 +1073,7 @@ int main(int argc, char** argv) {
+     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+         check_alloc_failures() || check_allocators() || check_xbox_slots())
+         return 1;
++    if (check_placed_resource_x()) return 1;
+     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
+     return 0;
+ }

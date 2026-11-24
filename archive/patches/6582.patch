@@ -1,0 +1,198 @@
+diff --git a/docs/runtime_imports.md b/docs/runtime_imports.md
+index 4d37f52746..058998979e 100644
+--- a/docs/runtime_imports.md
++++ b/docs/runtime_imports.md
+@@ -186,8 +186,12 @@ measurement in `d3d12_vulkan.md`, because its page could not be found.
+ Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the
+ GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in either. Both carry the wide string
+ `xgameruntime.dll` and the ASCII names `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`,
+-`QueryApiImpl` and `UninitializeApiImpl`, next to a statically linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s
+-thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
++`QueryApiImpl`, `UninitializeApiImpl` and `XErrorReport` (one block of strings in each DLL), next to a statically
++linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s thunks `LoadLibraryW` the runtime and `GetProcAddress` those
++six names at run time. A runtime without `XErrorReport` is refused before any initializer is called: with only the
++five entry points served, the package's own libHttpClient `HCInitialize` returned `0x89240101`
++(`E_GAMERUNTIME_DLL_NOT_FOUND`) and XCurl's `curl_global_init` returned `CURLE_FAILED_INIT`, both called through
++`gta6rt --run` by a stand-in program that loads the two DLLs from the package. xodus-gaming/xgameruntime-docs
+ (GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
+ `XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
+ mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
+@@ -198,11 +202,13 @@ shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `
+ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
+ with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
+ 
+-`runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
+-version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
+-`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
+-(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
+-`XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs' layout (below); for any other class it logs
++`runtime/shims/xgameruntime.cpp` serves the five entry points and `XErrorReport(HRESULT, const char*)`, the same
++function as `IXErrorImpl` slot 3 (below), so a report reaches the callback `XErrorSetCallback` set either way. The
++initializers succeed offline and log the GDK version and mode once. `QueryApiImpl` serves `XThreadingImpl`,
++`XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`, `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`,
++`XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
++`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs'
++layout (below); for any other class it logs
+ the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
+ the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
+ the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
+@@ -213,7 +219,8 @@ the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` s
+ pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
+ host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
+ case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
+-one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
++one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time. `curl_global_init` also
++asks that module for `InitializeApiImpl`, which is not served; the call succeeds without it.
+ 
+ ### Class layouts, measured
+ 
+diff --git a/runtime/shims/library_loader.cpp b/runtime/shims/library_loader.cpp
+index 2fa04c75f5..13a193e5d2 100644
+--- a/runtime/shims/library_loader.cpp
++++ b/runtime/shims/library_loader.cpp
+@@ -2,9 +2,10 @@
+ //
+ // GDK code does not always import the console runtime. The package's libHttpClient.GDK.dll and XCurl.dll have no
+ // import entry for xgameruntime.dll at all: their statically linked xgameruntime.lib thunks hold the wide string
+-// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl and
+-// UninitializeApiImpl, and look them up at run time (docs/runtime_imports.md, "Run-time loaded modules"). Bound to the
+-// host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach the offline shims.
++// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl,
++// UninitializeApiImpl and XErrorReport, and look them up at run time (docs/runtime_imports.md, "Run-time loaded
++// modules"). Bound to the host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach
++// the offline shims.
+ //
+ // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
+ // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
+diff --git a/runtime/shims/xgameruntime.cpp b/runtime/shims/xgameruntime.cpp
+index 30871d2571..1df5eaed1e 100644
+--- a/runtime/shims/xgameruntime.cpp
++++ b/runtime/shims/xgameruntime.cpp
+@@ -61,6 +61,8 @@ std::atomic<int> g_runtime_refs{0};
+ // (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
+ // query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
+ // with the executable lists the interfaces to implement next.
++//
++// The thunks look up a sixth name, XErrorReport (served below GetApiVersionImpl), and refuse the runtime without it.
+ 
+ struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
+     uint32_t unknown;      // documented as always 1
+@@ -646,6 +648,13 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
+     return S_OK;
+ }
+ 
++// XErrorReport, the sixth name xgameruntime.lib's thunks GetProcAddress in xgameruntime.dll: in both package DLLs its
++// string sits in the same block as the five entry points above, and when the lookup fails the thunks give up before
++// they call an initializer (libHttpClient.GDK.dll's initialisation then returns 0x89240101,
++// E_GAMERUNTIME_DLL_NOT_FOUND, and XCurl.dll's fails too). The arguments are IXErrorImpl slot 3's without `this`, and
++// the slot's function serves it, so a report reaches the callback XErrorSetCallback set either way.
++HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
++
+ // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
+ HRESULT __stdcall XGameRuntimeInitialize() {
+     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
+@@ -1323,6 +1332,7 @@ SHIM_TABLE(xgameruntime,
+     XGR(InitializeApiImplEx2),
+     XGR(UninitializeApiImpl),
+     XGR(QueryApiImpl),
++    XGR(XErrorReport),  // looked up with the five above; without it the thunks refuse the runtime
+     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
+     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
+     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
+diff --git a/runtime/test/fixtures/tiny_gdk_load.cpp b/runtime/test/fixtures/tiny_gdk_load.cpp
+index 7a6ca6cc6c..2d1cf6af34 100644
+--- a/runtime/test/fixtures/tiny_gdk_load.cpp
++++ b/runtime/test/fixtures/tiny_gdk_load.cpp
+@@ -1,7 +1,7 @@
+ // A mapped program that reaches the GDK runtime the way xgameruntime.lib's thunks do: it has no import of
+-// xgameruntime.dll, loads it with LoadLibraryW and looks the five run-time entry points up with GetProcAddress
+-// (measured in the package's libHttpClient.GDK.dll and XCurl.dll, docs/runtime_imports.md "Run-time loaded
+-// modules"). Run under `gta6rt --run`, its own kernel32 imports are bound by the loader, so LoadLibraryW and
++// xgameruntime.dll, loads it with LoadLibraryW and looks the five run-time entry points and XErrorReport up with
++// GetProcAddress (measured in the package's libHttpClient.GDK.dll and XCurl.dll, docs/runtime_imports.md "Run-time
++// loaded modules"). Run under `gta6rt --run`, its own kernel32 imports are bound by the loader, so LoadLibraryW and
+ // GetProcAddress must reach runtime/shims/library_loader.cpp and the offline xgameruntime shim. Run on its own,
+ // LoadLibraryW goes to Windows and either fails or loads the PC's Gaming Services runtime, and this never prints
+ // PASS. Ordinary test code; no game data.
+@@ -23,6 +23,9 @@ struct Options {        // InitializeApiImplEx2's fourth argument (xodus-gaming/
+ using InitEx2 = HRESULT(WINAPI*)(ULONG, ULONG, char, const Options*);
+ using Query = HRESULT(WINAPI*)(const GUID*, REFIID, void**);
+ using Uninit = HRESULT(WINAPI*)();
++using Report = HRESULT(WINAPI*)(HRESULT, const char*);
++
++HRESULT g_reported = S_OK;  // what the XErrorSetCallback callback last received
+ 
+ int fail(const char* stage, unsigned long value) {
+     std::printf("tiny_gdk_load: FAIL %s (0x%08lx)\n", stage, value);
+@@ -66,8 +69,9 @@ int main() {
+     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &host_view) && host_view == runtime)
+         return fail("xgameruntime.dll came from the host loader, not the shims", 0);
+ 
++    // XErrorReport too: the thunks look it up with the five entry points and refuse the runtime when it is missing.
+     const char* names[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl",
+-                           "QueryApiImpl"};
++                           "QueryApiImpl", "XErrorReport"};
+     for (const char* name : names)
+         if (!GetProcAddress(runtime, name)) return fail(name, GetLastError());
+     SetLastError(0);
+@@ -98,6 +102,27 @@ int main() {
+     reinterpret_cast<Close>(vtable[17])(obj, queue);
+     reinterpret_cast<Release>(vtable[2])(obj);
+ 
++    // The XErrorReport export and XErrorImpl's slot 3 are one function: a report through the export reaches the
++    // callback XErrorImpl's slot 4 (XErrorSetCallback) set.
++    const GUID error_class = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
++    void* error = nullptr;
++    hr = query(&error_class, error_class, &error);
++    if (hr != S_OK || !error) return fail("QueryApiImpl hands out XErrorImpl", static_cast<unsigned long>(hr));
++    void* const* error_vtable = *static_cast<void* const* const*>(error);
++    using Callback = bool(CALLBACK*)(HRESULT, const char*, void*);
++    using SetCallback = void(STDMETHODCALLTYPE*)(void*, Callback, void*);
++    const Callback on_error = [](HRESULT reported, const char*, void*) {
++        g_reported = reported;
++        return true;
++    };
++    reinterpret_cast<SetCallback>(error_vtable[4])(error, on_error, nullptr);
++    auto report = reinterpret_cast<Report>(GetProcAddress(runtime, "XErrorReport"));
++    hr = report(E_FAIL, "tiny_gdk_load");
++    reinterpret_cast<SetCallback>(error_vtable[4])(error, nullptr, nullptr);
++    reinterpret_cast<Release>(error_vtable[2])(error);
++    if (hr != S_OK || g_reported != E_FAIL)
++        return fail("the XErrorReport export reaches the XErrorSetCallback callback", static_cast<unsigned long>(hr));
++
+     // A class not served (an id no runtime class has, made up for this test) is refused, with the out pointer
+     // cleared.
+     const GUID unserved = {0x4c454f4e, 0x4944, 0x4100, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}};
+diff --git a/runtime/test/xgameruntime_test.cpp b/runtime/test/xgameruntime_test.cpp
+index e6cf380757..5841473e20 100644
+--- a/runtime/test/xgameruntime_test.cpp
++++ b/runtime/test/xgameruntime_test.cpp
+@@ -267,8 +267,8 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
+ }
+ 
+ // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
+-// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
+-// bound by the api set XCurl.dll imports them from, as a mapped image would be.
++// entry points and XErrorReport (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path
++// through the loader shims, bound by the api set XCurl.dll imports them from, as a mapped image would be.
+ void check_run_time_load() {
+     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
+     using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+@@ -295,12 +295,15 @@ void check_run_time_load() {
+           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
+ 
+     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
+-                                  "UninitializeApiImpl", "QueryApiImpl"};
++                                  "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
+     bool all = true;
+     for (const char* n : entry_points)
+         all = all && get_proc(rt_mod, n) &&
+               reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
+-    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
++    check(all, "GetProcAddress serves the six names xgameruntime.lib looks up (five entry points and XErrorReport)");
++    using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
++    auto report_export = reinterpret_cast<ReportExport>(get_proc(rt_mod, "XErrorReport"));
++    check(report_export && report_export(E_FAIL, "export") == S_OK, "the XErrorReport export answers S_OK");
+     SetLastError(0);
+     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
+           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");

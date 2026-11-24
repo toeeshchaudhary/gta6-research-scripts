@@ -1,0 +1,159 @@
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 33b52d422f..e62e8bc01f 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -3432,7 +3432,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
+ | Binning | The GDK topic index names Xbox binning modes (NDA content) | Should be a no-op if the game uses it only as an optimisation: it changes how a render pass uses on-chip memory, not the result. Log and ignore for the first boot; revisit for performance. **Open** whether the game relies on binning for correctness. |
+ | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
+ | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
+-| Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
++| Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The retail executable confirms 48 and 73 (measured under `gta6rt --run`): it creates four compute queues through 48 with console `Flags` 1, 2 and 3 (2 and 3 are no PC flag), which `CreateCommandQueueX` drops before the PC path. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
+ | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
+ | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
+ | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index e17a80353b..6fc24e5441 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1146,6 +1146,31 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
+     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
+ }
+ 
++// Device slot 48, CreateCommandQueueX(desc, riid, out). The retail title (game_scarlett_master.exe 1.0.2.1, measured
++// under gta6rt --run) creates its four compute queues here with console Flags: {COMPUTE, priority 0, Flags 1, 2 and 3,
++// node mask 0} and {COMPUTE, 0, Flags 0, node mask 1}. Those Flags read as a console queue selector, not the PC bits:
++// 2 and 3 are no PC queue flag, so the Vulkan device refuses them (E_INVALIDARG) and the title asserts on the second
++// queue, and PC flag 1 (DISABLE_GPU_TIMEOUT) means nothing to it. The flags are dropped (each value logged once) and
++// the rest of the description takes slot 8's path.
++HRESULT proxy_create_command_queue_x(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
++                                     void** out) {
++    if (!desc) {
++        if (out) *out = nullptr;
++        return E_INVALIDARG;
++    }
++    D3D12_COMMAND_QUEUE_DESC pc_desc = *desc;
++    const auto flags = static_cast<std::uint32_t>(pc_desc.Flags);
++    if (flags != 0) {
++        static std::atomic<std::uint32_t> logged{0};
++        const std::uint32_t bit = flags < 32 ? (1u << flags) : 0x80000000u;
++        if ((logged.fetch_or(bit, std::memory_order_relaxed) & bit) == 0)
++            std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueueX: console queue flags 0x%x dropped (type %d)\n",
++                         flags, static_cast<int>(pc_desc.Type));
++        pc_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
++    }
++    return proxy_create_command_queue(self, &pc_desc, riid, out);
++}
++
+ // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
+ // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
+ // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
+@@ -1549,9 +1574,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+         }
+         if (Slot == routes.queue_x) {
+             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
+-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+-                                                        reinterpret_cast<const IID*>(a2),
+-                                                        reinterpret_cast<void**>(a3)));
++            return hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
++                                                          reinterpret_cast<const IID*>(a2),
++                                                          reinterpret_cast<void**>(a3)));
+         }
+         if (Slot == routes.list_x) {
+             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
+diff --git a/runtime/test/device_proxy_test.cpp b/runtime/test/device_proxy_test.cpp
+index 46a853e7c3..590f7a2138 100644
+--- a/runtime/test/device_proxy_test.cpp
++++ b/runtime/test/device_proxy_test.cpp
+@@ -8,6 +8,7 @@
+ //   slot 62  CreateComputePipelineState
+ //   slot 76  resource creation with an Xbox layout word (0x101)
+ //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
++//   slot 48  the console's second queue creation (compute queues; console Flags dropped)
+ // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
+ // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
+ #include <windows.h>
+@@ -495,6 +496,42 @@ int main(int argc, char** argv) {
+             check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
+                   "the queue proxy's GetDevice is the device the shim returned");
+         }
++
++        // Slot 48: the console's second queue creation (PC slot 48 is OpenExistingHeapFromAddress). The retail title
++        // creates its compute queues here with console Flags 1, 2 and 3 (node mask 0) and 0 (node mask 1); 2 and 3
++        // are no PC flag, so the proxy drops them. Every one must give a working queue proxy.
++        check(rt::d3d12_xs::device_slot_overridden(48), "device slot 48 is the console queue-creation override");
++        const D3D12_COMMAND_QUEUE_DESC console_descs[] = {
++            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(1), 0},
++            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(2), 0},
++            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, static_cast<D3D12_COMMAND_QUEUE_FLAGS>(3), 0},
++            {D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 1},
++        };
++        for (const D3D12_COMMAND_QUEUE_DESC& console_desc : console_descs) {
++            ComPtr<ID3D12CommandQueue> compute;
++            hr = reinterpret_cast<CreateQueueFn>(vtable[48])(device.Get(), &console_desc, &iid_queue,
++                                                             reinterpret_cast<void**>(compute.GetAddressOf()));
++            check(SUCCEEDED(hr) && rt::d3d12_xs::is_queue_proxy(compute.Get()),
++                  "slot 48 returns a queue proxy for a console compute-queue description");
++            if (compute) {
++                const D3D12_COMMAND_QUEUE_DESC got = compute->GetDesc();
++                check(got.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE && got.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE,
++                      "slot 48's queue is a compute queue with the console flags dropped");
++            }
++            if (compute && fence) {
++                HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++                const UINT64 value = fence->GetCompletedValue() + 1;
++                check(event && SUCCEEDED(compute->Signal(fence.Get(), value)) &&
++                          SUCCEEDED(fence->SetEventOnCompletion(value, event)) &&
++                          WaitForSingleObject(event, 5000) == 0,
++                      "slot 48's compute queue signals the fence proxy on the GPU");
++                if (event) CloseHandle(event);
++            }
++        }
++        ComPtr<ID3D12CommandQueue> none;
++        hr = reinterpret_cast<CreateQueueFn>(vtable[48])(device.Get(), nullptr, &iid_queue,
++                                                         reinterpret_cast<void**>(none.GetAddressOf()));
++        check(hr == E_INVALIDARG && !none, "slot 48 refuses a null description with a null output");
+     }
+ 
+     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index f0030116bd..ed52f55805 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -223,6 +223,12 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
+         ++self->calls[Slot];
+         const std::uint64_t words[] = {a1, a2, a3, a4, a5};
+         std::memcpy(self->args[Slot], words, sizeof(words));
++        // Device slot 8 (CreateCommandQueue): keep the description as received, since a caller may pass a copy
++        // that does not outlive the call (CreateCommandQueueX drops the console flags into a local).
++        if constexpr (Slot == 8) {
++            if (self->kind == Kind::device && a1)
++                std::memcpy(self->array[8], reinterpret_cast<const void*>(a1), sizeof(D3D12_COMMAND_QUEUE_DESC));
++        }
+         return mock_call(self, Slot, words);
+     }
+ }
+@@ -718,7 +724,23 @@ int check_xbox_slots() {
+     void* queue = nullptr;
+     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
+-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
++    EXPECT(std::memcmp(mock->array[8], &kQueueDesc, sizeof(kQueueDesc)) == 0);
++
++    // The retail title's compute queues carry console Flags (1, 2, 3; 2 and 3 are no PC flag). They are dropped:
++    // the PC path gets the same type, priority and node mask with Flags 0.
++    for (std::uint32_t console_flags : {1u, 2u, 3u}) {
++        D3D12_COMMAND_QUEUE_DESC console_desc{};
++        console_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
++        console_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(console_flags);
++        void* compute = nullptr;
++        EXPECT(hr_of(raw(device, 48, word(&console_desc), word(&kQueueIid), word(&compute))) == S_OK);
++        EXPECT(xs::is_queue_proxy(compute));
++        D3D12_COMMAND_QUEUE_DESC received{};
++        std::memcpy(&received, mock->array[8], sizeof(received));
++        EXPECT(received.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE && received.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE &&
++               received.NodeMask == 0 && received.Priority == 0);
++        if (compute) release(compute);
++    }
+ 
+     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
+     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.

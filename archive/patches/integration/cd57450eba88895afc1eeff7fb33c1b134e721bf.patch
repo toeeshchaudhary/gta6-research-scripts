@@ -1,0 +1,255 @@
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 146192ad3..3ca47221f 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -1517,6 +1517,49 @@ const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc, bool uma) {
+     return nullptr;
+ }
+ 
++// The initial-state bits a texture may start in (measured on an RTX 3060 / 610.88, see initial_state_refusal). The
++// write bits are the ones a resource flag backs.
++constexpr UINT kTextureWriteStates = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
++                                     D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_COPY_DEST |
++                                     D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE |
++                                     D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE | D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
++constexpr UINT kTextureShaderReadStates =
++    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++constexpr UINT kTextureReadStates = D3D12_RESOURCE_STATE_DEPTH_READ | kTextureShaderReadStates |
++                                    D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_RESOLVE_SOURCE |
++                                    D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE |
++                                    D3D12_RESOURCE_STATE_VIDEO_DECODE_READ | D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ |
++                                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ;
++constexpr UINT kTextureStates = kTextureWriteStates | kTextureReadStates;
++
++// The initial state a texture is created in. The console names states out of its own numbering, so a texture is asked
++// to start in bit patterns D3D12 only allows on a buffer: the retail boot's targets arrive as 0x6 (INDEX_BUFFER |
++// RENDER_TARGET, the value both of its first two textures pass, flags 0x1 then 0x2). A state the PC rules already
++// accept is kept; one whose write bit the resource's own flags do not back is replaced by the state those flags ask
++// for: RENDER_TARGET with ALLOW_RENDER_TARGET, DEPTH_WRITE with ALLOW_DEPTH_STENCIL, UNORDERED_ACCESS with
++// ALLOW_UNORDERED_ACCESS, GENERIC_READ with ALLOW_SIMULTANEOUS_ACCESS (a shared texture has no other write state).
++// A state no flag can account for is returned unchanged, so initial_state_refusal still refuses it. Buffers take any
++// bits and are left alone.
++D3D12_RESOURCE_STATES console_initial_state(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
++    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return state;
++    const UINT flags = UINT(desc.Flags);
++    const UINT s = UINT(state);
++    const UINT kept = s & kTextureStates;
++    const UINT writes = kept & kTextureWriteStates;
++    if (kept == s && !writes) return state;  // already a texture state, or no write bit
++    if (writes && !(writes & (writes - 1))) {  // exactly one write bit: it stands when its flag is set
++        if ((writes == D3D12_RESOURCE_STATE_RENDER_TARGET && (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) ||
++            (writes == D3D12_RESOURCE_STATE_UNORDERED_ACCESS && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) ||
++            (writes == D3D12_RESOURCE_STATE_DEPTH_WRITE && (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
++            return state;
++    }
++    if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return D3D12_RESOURCE_STATE_RENDER_TARGET;
++    if (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
++    if (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    if (flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) return D3D12_RESOURCE_STATE_GENERIC_READ;
++    return state;
++}
++
+ // Why the host would refuse this committed resource, or null if these checks pass. The flag and format tables were
+ // measured on an RX 9070 XT, an integrated Radeon and WARP, which agree on all of them. Cross-adapter resources
+ // (valid there only as a row-major texture on a SHARED | SHARED_CROSS_ADAPTER heap) are refused: this layer has no
+@@ -1530,7 +1573,8 @@ const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc, bool uma) {
+ // takes exactly GENERIC_READ, or one write state alone (RENDER_TARGET, UNORDERED_ACCESS and DEPTH_WRITE need the
+ // matching resource flag), or any mix of read states (DEPTH_READ needs ALLOW_DEPTH_STENCIL; the shader-resource
+ // states are refused with DENY_SHADER_RESOURCE). The buffer-only bits (vertex/constant, index, indirect, stream
+-// output, acceleration structure) and undefined bits are refused on a texture, also inside a mix.
++// output, acceleration structure) and undefined bits are refused on a texture, also inside a mix; callers pass the
++// state through console_initial_state first, so what reaches here is the console's numbering made a texture state.
+ const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES state,
+                                   bool acceleration_structures) {
+     const UINT s = UINT(state);
+@@ -1543,16 +1587,9 @@ const char* initial_state_refusal(bool buffer, UINT flags, D3D12_RESOURCE_STATES
+         return nullptr;
+     }
+     if (s == D3D12_RESOURCE_STATE_GENERIC_READ) return nullptr;
+-    constexpr UINT writes = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS |
+-                            D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_COPY_DEST |
+-                            D3D12_RESOURCE_STATE_RESOLVE_DEST | D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE |
+-                            D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE | D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
+-    constexpr UINT shader_reads =
+-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+-    constexpr UINT reads = D3D12_RESOURCE_STATE_DEPTH_READ | shader_reads | D3D12_RESOURCE_STATE_COPY_SOURCE |
+-                           D3D12_RESOURCE_STATE_RESOLVE_SOURCE | D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE |
+-                           D3D12_RESOURCE_STATE_VIDEO_DECODE_READ | D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ |
+-                           D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ;
++    constexpr UINT writes = kTextureWriteStates;
++    constexpr UINT shader_reads = kTextureShaderReadStates;
++    constexpr UINT reads = kTextureReadStates;
+     if (s & ~(writes | reads)) return "initial state of a texture (buffer-only or undefined bits)";
+     if (s & writes) {
+         if (s & (s - 1)) return "initial state of a texture (a write state with another state)";
+@@ -6957,7 +6994,9 @@ public:
+         // an upload or readback heap (COPY_DEST in an upload heap, GENERIC_READ in a readback heap), where a
+         // committed buffer must start in GENERIC_READ or COPY_DEST. UAV access is refused there all the same.
+         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+-        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, state, clear,
++        D3D12_RESOURCE_STATES initial = console_initial_state(*desc, state);
++        if (initial != state) log_once("placed texture initial state mapped:", int(initial));
++        const char* why = committed_resource_refusal(default_heap, D3D12_HEAP_FLAG_NONE, *desc, initial, clear,
+                                                      acceleration_structures(), state_.uma);
+         const D3D12_HEAP_TYPE heap_type = heap->properties().Type;
+         if (!why && (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) &&
+@@ -8094,8 +8133,13 @@ private:
+         const auto finish = [&](HRESULT hr) { return method ? d3d12_trace::result(method, hr) : hr; };
+         if (out) *out = nullptr;
+         if (!heap || !desc) return finish(E_INVALIDARG);
+-        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, state, clear,
+-                                                         acceleration_structures(), state_.uma)) {
++        D3D12_RESOURCE_STATES initial = console_initial_state(*desc, state);
++        if (initial != state)
++            log_once((std::string(method ? method : "CreateCommittedResource") + " texture initial state mapped")
++                         .c_str(),
++                     int(initial));
++        if (const char* why = committed_resource_refusal(*heap, heap_flags, *desc, initial, clear,
++                                                        acceleration_structures(), state_.uma)) {
+             log_once((std::string(method ? method : "CreateCommittedResource") + " refused (" + why + "), dimension")
+                          .c_str(),
+                      int(desc->Dimension));
+@@ -8112,7 +8156,7 @@ private:
+                      int(desc->Dimension));
+             return finish(E_INVALIDARG);
+         }
+-        return finish(create_committed(heap, heap_flags, desc, state, castable_count, castable, riid, out));
++        return finish(create_committed(heap, heap_flags, desc, initial, castable_count, castable, riid, out));
+     }
+ 
+     // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
+@@ -8269,7 +8313,8 @@ private:
+             }
+             backing.MipLevels = desc->MipLevels;
+         }
+-        if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing, state, clear,
++        if (const char* why = committed_resource_refusal(heap, D3D12_HEAP_FLAG_NONE, backing,
++                                                         console_initial_state(backing, state), clear,
+                                                          acceleration_structures(), state_.uma)) {
+             log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(desc->Dimension));
+             return d3d12_trace::result(method, E_INVALIDARG);
+diff --git a/runtime/test/d3d12_vulkan_device_test.cpp b/runtime/test/d3d12_vulkan_device_test.cpp
+index 062733047..9e30389fe 100644
+--- a/runtime/test/d3d12_vulkan_device_test.cpp
++++ b/runtime/test/d3d12_vulkan_device_test.cpp
+@@ -3152,6 +3152,9 @@ int compare_invalid_arguments(ID3D12Device* ours) {
+         InvalidCase call;
+         bool (*comparable)(ID3D12Device*) = nullptr;
+         bool windows10_refuses = false;
++        // The layer maps the console's initial-state numbering onto a state the resource's flags back
++        // (console_initial_state), so ours is accepted where the PC runtime, asked the same words, refuses.
++        bool console_state = false;
+     };
+     const auto device10 = [](ID3D12Device* d) {
+         Ref<ID3D12Device10> newer;
+@@ -3192,7 +3195,8 @@ int compare_invalid_arguments(ID3D12Device* ours) {
+         // CreateCommittedResource: the initial state. A buffer takes any bits but the acceleration-structure state
+         // without UAV access; a texture takes GENERIC_READ, one write state alone (RENDER_TARGET, UNORDERED_ACCESS,
+         // DEPTH_WRITE with their flag), or a mix of read states (DEPTH_READ with ALLOW_DEPTH_STENCIL, the shader
+-        // resource states without DENY_SHADER_RESOURCE), and never a buffer-only or undefined bit.
++        // resource states without DENY_SHADER_RESOURCE), and never a buffer-only or undefined bit. The console's
++        // numbering puts buffer bits on textures; those cases are marked console_state and mapped (console_initial_state).
+         {"committed: plain texture in RENDER_TARGET state", [](ID3D12Device* d) {
+              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+          }},
+@@ -3266,6 +3270,30 @@ int compare_invalid_arguments(ID3D12Device* ours) {
+         {"committed: texture in state 0x80000000", [](ID3D12Device* d) {
+              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATES(0x80000000u));
+          }},
++        // The console's own numbering: a texture asked to start in the buffer-only INDEX_BUFFER bit with its write
++        // state. The layer maps it (console_initial_state); the PC runtime refuses it.
++        {"committed: render target in INDEX_BUFFER | RENDER_TARGET state", [](ID3D12Device* d) {
++             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
++                              D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_INDEX_BUFFER |
++                                                    D3D12_RESOURCE_STATE_RENDER_TARGET));
++         }, nullptr, false, true},
++        {"committed: depth texture in INDEX_BUFFER | RENDER_TARGET state", [](ID3D12Device* d) {
++             return committed(d, {D3D12_HEAP_TYPE_DEFAULT},
++                              texture_desc(16, 16, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL),
++                              D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_INDEX_BUFFER |
++                                                    D3D12_RESOURCE_STATE_RENDER_TARGET));
++         }, nullptr, false, true},
++        {"committed: UAV texture in VERTEX_AND_CONSTANT_BUFFER | UNORDERED_ACCESS state", [](ID3D12Device* d) {
++             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
++                              D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
++                                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
++         }, nullptr, false, true},
++        // No flag backs the buffer bit and the state names no texture write state: still refused, as on the host.
++        {"committed: plain texture in INDEX_BUFFER | RENDER_TARGET state", [](ID3D12Device* d) {
++             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(),
++                              D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_INDEX_BUFFER |
++                                                    D3D12_RESOURCE_STATE_RENDER_TARGET));
++         }},
+         {"committed: texture in RESOLVE_DEST state", [](ID3D12Device* d) {
+              return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_RESOLVE_DEST);
+          }},
+@@ -4308,6 +4336,17 @@ int compare_invalid_arguments(ID3D12Device* ours) {
+         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
+         if (a == b) continue;
++        if (c.console_state) {
++            // The layer maps the console's initial-state numbering, so only its own answer is checked here.
++            if (a != S_OK) {
++                ++mismatches;
++                std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, a mapped console state must be accepted\n",
++                             c.name, a);
++            } else {
++                std::printf("invalid arguments %s: accepted as a console state (host 0x%08lx)\n", c.name, b);
++            }
++            continue;
++        }
+         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+         if (c.comparable && !c.comparable(host.p)) {
+             std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,
+@@ -4380,6 +4419,7 @@ int compare_heap_neighbours(ID3D12Device* ours) {
+         const char* name;
+         InvalidCase call;
+         bool windows10_refuses = false;
++        bool console_state = false;
+     };
+     static const Case cases[] = {
+         {"heap: alignment 0", [](ID3D12Device* d) { return heap_create(d, heap_desc_of(0)); }},
+@@ -4416,6 +4456,17 @@ int compare_heap_neighbours(ID3D12Device* ours) {
+     for (const Case& c : cases) {
+         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+         if (a == b) continue;
++        if (c.console_state) {
++            // The layer maps the console's initial-state numbering, so only its own answer is checked here.
++            if (a != S_OK) {
++                ++mismatches;
++                std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, a mapped console state must be accepted\n",
++                             c.name, a);
++            } else {
++                std::printf("invalid arguments %s: accepted as a console state (host 0x%08lx)\n", c.name, b);
++            }
++            continue;
++        }
+         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+         ++mismatches;
+         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
+@@ -4496,6 +4547,7 @@ int compare_placed_reserved(ID3D12Device* ours) {
+         InvalidCase call;
+         bool (*comparable)(ID3D12Device*) = nullptr;
+         bool windows10_refuses = false;
++        bool console_state = false;
+     };
+     static const Case cases[] = {
+         // The standalone device has acceleration structures (XDXR, or KHR with LEONIDA_RT_AS=khr) and accepts a UAV
+@@ -4914,6 +4966,17 @@ int compare_placed_reserved(ID3D12Device* ours) {
+         const HRESULT a = call_guarded(c.call, ours), b = call_guarded(c.call, host.p);
+         if (verbose) std::printf(" ours 0x%08lx host 0x%08lx\n", a, b);
+         if (a == b) continue;
++        if (c.console_state) {
++            // The layer maps the console's initial-state numbering, so only its own answer is checked here.
++            if (a != S_OK) {
++                ++mismatches;
++                std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, a mapped console state must be accepted\n",
++                             c.name, a);
++            } else {
++                std::printf("invalid arguments %s: accepted as a console state (host 0x%08lx)\n", c.name, b);
++            }
++            continue;
++        }
+         if (c.windows10_refuses && windows10_refusal(c.name, host.p, a, b)) continue;
+         if (c.comparable && !c.comparable(host.p)) {
+             std::printf("invalid arguments %s: not comparable on this host (ours 0x%08lx, host 0x%08lx)\n", c.name,

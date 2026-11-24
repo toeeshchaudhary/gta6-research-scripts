@@ -1,0 +1,210 @@
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 019f66fa28..c4b12536e9 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -3457,6 +3457,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
+ | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
+ | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
+ | Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
++| Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix, for a caller in an image the guest loader mapped; the PC slot 61 is `CreateMetaCommand`, which any other caller (a host test driving the device through the proxy) still gets. The layout of the description beyond the PC fields is **Open**. |
+ | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
+ | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
+ | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
+diff --git a/runtime/shims/d3d12_xs.cpp b/runtime/shims/d3d12_xs.cpp
+index 8e54c3fd56..ceb90de265 100644
+--- a/runtime/shims/d3d12_xs.cpp
++++ b/runtime/shims/d3d12_xs.cpp
+@@ -155,6 +155,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
+         std::fprintf(stderr,
+                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
+                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
++        // A console method whose slot is another PC method (61) is served only to the title: a caller in an image
++        // this loader mapped.
++        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
++            std::uint64_t base = 0;
++            return rt::shims::mapped_image_base(address, base);
++        });
+     }
+ 
+ #ifdef LEONIDA_VULKAN_DEVICE
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index e17a80353b..f1ad3410eb 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include <windows.h>
+ #include <dxgi1_4.h>
++#include <intrin.h>  // _ReturnAddress: slot 61 serves a console caller differently from a host one
+ 
+ #include <atomic>
+ #include <cerrno>
+@@ -139,6 +140,7 @@ const char* slot_name(unsigned slot) {
+         case 46: return "SetResidencyPriority (proxies unwrapped)";
+         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
+         case 50: return "EnqueueMakeResident (proxies unwrapped)";
++        case 61: return "Xbox CreateSamplerX -> PC CreateSampler (a host caller gets PC CreateMetaCommand)";
+         case 62: return "Xbox CreateComputePipelineState";
+         case 67: return "Xbox DeserializeComputePipelineStateX";
+         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
+@@ -1370,6 +1372,38 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
+     return self->real->CreateComputePipelineState(desc, *riid, out);
+ }
+ 
++// The Xbox slot 61 is CreateSamplerX(desc, dest): a sampler written to a CPU descriptor handle, with the PC
++// CreateSampler's two arguments. Measured on the retail title's boot (stop 20 in #6910's RT-5 measurements): the
++// title calls it once per sampler after its descriptor heaps exist, and it goes on when the call is served by the PC
++// CreateSampler. The PC slot 61 is CreateMetaCommand, which would take these words as (CommandId, NodeMask, ...).
++// HYPOTHESIS: the console description begins with the PC D3D12_SAMPLER_DESC (52 bytes), which is what got the title
++// past this call; whatever follows it is not known and not read. The title was not seen testing a result, so a null
++// description is skipped rather than reported. The handle is passed as given: a handle in the title's own heap range
++// is #7021's translation.
++// The same proxy also serves host callers (the runtime's own tests drive the Vulkan device through it), for whom slot
++// 61 is the PC ID3D12Device5::CreateMetaCommand. So the slot is CreateSamplerX only for a caller in an image the
++// guest loader mapped (set_console_caller); any other caller, or every caller when no check is installed, gets the PC
++// method. Without the check d3d12_vulkan_device_test's CreateMetaCommand call reached this handler (#7115).
++std::atomic<ConsoleCaller> g_console_caller{nullptr};
++
++bool is_console_caller(const void* address) {
++    const ConsoleCaller classify = g_console_caller.load(std::memory_order_acquire);
++    return classify && classify(reinterpret_cast<std::uint64_t>(address));
++}
++
++void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, std::uint64_t dest) {
++    note_slot(61);
++    if (!desc) {
++        static std::atomic<bool> logged{false};
++        if (!logged.exchange(true, std::memory_order_relaxed))
++            std::fprintf(stderr, "[rt] d3d12_xs: slot 61 CreateSamplerX without a description (skipped)\n");
++        return;
++    }
++    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
++    handle.ptr = static_cast<SIZE_T>(dest);
++    self->real->CreateSampler(desc, handle);
++}
++
+ // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
+ // DeserializeComputePipelineStateX in amd_fidelityfx_upscaler_xbox.dll's messages (call at RVA 0x56d9). The desc
+ // passes the root signature at +0x00, followed by pointer/size pairs for the shader's FSPX entries (docs/fspx.md):
+@@ -1517,6 +1551,20 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+         return hr_to_u64(proxy_create_compute_pipeline_state(
+             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
+             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
++    } else if constexpr (Slot == 61) {
++        if (is_console_caller(_ReturnAddress())) {
++            proxy_create_sampler_x(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1), a2);
++            return 0;
++        }
++        // A host caller: the PC slot 61 (ID3D12Device5::CreateMetaCommand), forwarded like any other PC method.
++        note_slot(Slot);
++        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
++        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
++                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
++                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
++                                                 std::uint64_t, std::uint64_t, std::uint64_t);
++        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
++        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+     } else if constexpr (Slot == 67) {
+         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
+             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
+@@ -1705,7 +1753,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ 
+ bool device_slot_overridden(unsigned slot) {
+     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
++        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 61 || slot == 62 || slot == 67 ||
+         slot == 75 || slot == 76)
+         return true;
+     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+@@ -1810,6 +1858,10 @@ bool heap_slot_overridden(unsigned slot) {
+     return slot <= 2 || slot == 7 || slot == 9 || slot == 10;
+ }
+ 
++void set_console_caller(ConsoleCaller classify) {
++    g_console_caller.store(classify, std::memory_order_release);
++}
++
+ std::uint64_t device_slot_hits(unsigned slot) {
+     start_hit_counts();
+     return slot < kMaxSlots ? g_hits[slot].load(std::memory_order_relaxed) : 0;
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 0019ec5069..3ee1a2be43 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -1,6 +1,8 @@
+ // Xbox-ABI proxy around a PC ID3D12Device.
+ //
+ // Measured Xbox device deviations used here (vtable indices, x64):
++//   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
++//             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's boot.
+ //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
+ //             before the IID. The PC slot 62 is CreateStateObject.
+ //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
+@@ -96,6 +98,12 @@ ID3D12Device* device_proxy_real_device(const void* device);
+ // handles for the allocator proxy.
+ bool device_slot_overridden(unsigned slot);
+ 
++// Whether a return address is in an image the guest loader mapped, i.e. the call comes from the title. Device slot 61
++// is CreateSamplerX for such a caller and the PC ID3D12Device5::CreateMetaCommand for any other; with no check
++// installed every caller is a host one. D3D12XboxCreateDevice installs rt::shims::mapped_image_base.
++using ConsoleCaller = bool (*)(std::uint64_t address);
++void set_console_caller(ConsoleCaller classify);
++
+ // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
+ // (no reference added), or null when the pointer is not such a proxy.
+ bool is_queue_proxy(const void* queue);
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index f0030116bd..62d9d47c78 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -687,7 +687,7 @@ int check_allocators() {
+     return 0;
+ }
+ 
+-// ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) ----
++// ---- 7. Xbox device slots from the public HLE (48, 73, 78, 79, 80) and the retail title (61) ----
+ //
+ // A device that answers ID3D12Device11 (80 PC slots) is the Vulkan layer's shape: slots 78/79 are inside its table
+ // (CreateReservedResource2/CreateSampler2 there) and 80 is just past it. None of the five may reach the mock's own
+@@ -752,14 +752,37 @@ int check_xbox_slots() {
+     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
+     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
+ 
+-    EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
+-           xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
++    // 61 is CreateSamplerX(desc, dest) for the title and the PC CreateMetaCommand for a host caller. With no
++    // console-caller check installed (a host program like this one), the call is the PC slot 61.
++    D3D12_SAMPLER_DESC sampler{};
++    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++    sampler.MaxLOD = D3D12_FLOAT32_MAX;
++    const std::uint64_t sampler_handle = 0x7ff012340040ull;
++    raw(device, 61, word(&sampler), sampler_handle);
++    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 0 && xs::device_slot_hits(61) == 1);
++    // A caller the check calls the title's (here every one): the PC CreateSampler (slot 22) gets the same two words,
++    // not the PC slot 61. A null description is skipped without reaching the device.
++    xs::set_console_caller([](std::uint64_t) { return true; });
++    raw(device, 61, word(&sampler), sampler_handle);
++    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 2);
++    EXPECT(mock->args[22][0] == word(&sampler) && mock->args[22][1] == sampler_handle);
++    raw(device, 61, 0, sampler_handle);
++    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 1 && xs::device_slot_hits(61) == 3);
++    // A caller outside the title's images is a host one again.
++    xs::set_console_caller([](std::uint64_t) { return false; });
++    raw(device, 61, word(&sampler), sampler_handle);
++    EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
++    xs::set_console_caller(nullptr);
++
++    EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(61) && xs::device_slot_overridden(73) &&
++           xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
+ 
+     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
+     EXPECT(release(queue) == 0);
+     EXPECT(release(device) == 0 && mock->refs == 0);
+-    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens without reaching "
+-                "the mock's own PC slots\n", g_label);
++    std::printf("%s: device slots 48/73/78/79/80 route to a queue, a list and frame-event tokens, and slot 61 to "
++                "CreateSampler, without reaching the mock's own PC slots\n", g_label);
+     return 0;
+ #else
+     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);

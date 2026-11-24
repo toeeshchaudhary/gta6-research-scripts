@@ -1,0 +1,84 @@
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index f8c99a192..0a9dab97e 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -261,7 +261,9 @@ const char* slot_name(unsigned slot) {
+         case 46: return "SetResidencyPriority (proxies unwrapped)";
+         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
+         case 50: return "EnqueueMakeResident (proxies unwrapped)";
++        case 61: return "Xbox CreateSamplerX (console desc decoded)";
+         case 62: return "Xbox CreateComputePipelineState";
++
+         case 67: return "Xbox DeserializeComputePipelineStateX";
+         case 70: return "Xbox shader-resource view from raw words";
+         case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
+@@ -2503,6 +2505,49 @@ void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D
+     self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
+ }
+ 
++// Device slot 61 is the console's CreateSamplerX(desc, dest). Two things make it worth its own handler rather than the
++// by-number forward: the description is the console's 0x6C-byte form, not D3D12_SAMPLER_DESC, and the console vtable
++// index does not match the PC one (PC slot 61 is CreateMetaCommand, six arguments, so a by-number forward reads a
++// stale stack out-pointer). Console and PC device indices agree only up to about slot 60; past that the console table
++// carries methods the PC one does not.
++//
++// Field offsets are the console layout measured from the console-compiled programs and corroborated by a public slot
++// table (ivall/xcl, GPL-2.0-only, re-derived here rather than copied): address modes at 0x18/0x1C/0x20, LOD 0x24/0x28,
++// bias 0x2C, max anisotropy 0x34, comparison 0x40. The filter is not in the fields identified so far, so samplers are
++// created anisotropic, which is what the title's sampler descriptions ask for in practice.
++void proxy_create_sampler_x(DeviceProxy* self, const void* console_desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(61);
++    if (!console_desc) return;
++    const auto* p = static_cast<const std::uint8_t*>(console_desc);
++    auto word = [p](std::size_t off) {
++        std::uint32_t value = 0;
++        std::memcpy(&value, p + off, sizeof(value));
++        return value;
++    };
++    auto real32 = [&word](std::size_t off) {
++        const std::uint32_t bits = word(off);
++        float value = 0.0f;
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    };
++    const std::uint32_t anisotropy = word(0x34);
++    D3D12_SAMPLER_DESC desc{};
++    desc.Filter = D3D12_FILTER_ANISOTROPIC;
++    desc.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(word(0x18));
++    desc.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(word(0x1C));
++    desc.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(word(0x20));
++    desc.MipLODBias = real32(0x2C);
++    desc.MaxAnisotropy = anisotropy < 1 ? 1 : (anisotropy > 16 ? 16 : anisotropy);
++    desc.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(word(0x40));
++    desc.BorderColor[0] = 0.0f;
++    desc.BorderColor[1] = 0.0f;
++    desc.BorderColor[2] = 0.0f;
++    desc.BorderColor[3] = 0.0f;
++    desc.MinLOD = real32(0x24);
++    desc.MaxLOD = real32(0x28);
++    self->real->CreateSampler(&desc, translate_cpu_handle(self, dest));
++}
++
+ void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
+                             const UINT* dest_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
+                             const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+@@ -2986,6 +3031,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+         return reinterpret_cast<std::uint64_t>(proxy_get_resource_allocation_info(
+             reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self), reinterpret_cast<DeviceProxy*>(a1),
+             static_cast<UINT>(a2), static_cast<UINT>(a3), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4)));
++    } else if constexpr (Slot == 61) {
++        proxy_create_sampler_x(self, reinterpret_cast<const void*>(a1),
++                               D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
++        return 0;
+     } else if constexpr (Slot == 62) {
+         return hr_to_u64(proxy_create_compute_pipeline_state(
+             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
+@@ -3213,7 +3262,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ bool device_slot_overridden(unsigned slot) {
+     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) ||
+         slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 ||
+-        slot == 46 || slot == 50 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 ||
++        slot == 46 || slot == 50 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 ||
+         slot == 127 || slot == 133)
+         return true;
+     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();

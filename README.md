@@ -11,3 +11,5 @@ The engine folder contains the Win32 Vulkan renderer, OBJ and DDS loaders, scene
 
 - [GTA VI research and renderer](reports/gta6-final.md)
 - [Leonida contributions and retail boot investigation](reports/leonida-final.md)
+
+[Additional captures, boot sources, integration patches and compressed traces](archive/). The manifest lists archived file hashes and skipped candidates. Trace exports redact user paths and omit matching dump or credential lines. Integration patches are individual comparisons against the parent (incoming parent for merges), not a sequential patch series.

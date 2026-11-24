@@ -1,0 +1,273 @@
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index c17b33e..6d95fc4 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -2722,8 +2722,13 @@ HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STAT
+     if (out) *out = nullptr;
+     if (self->slot_count <= 47) return refuse_beyond_device(86, self->slot_count);  // predates ID3D12Device2
+     if (!riid) return E_POINTER;
+-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
+-    return reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
++    // Supporting an interface does not make its pointer or vtable identical to the original device's.
++    ID3D12Device2* device2 = nullptr;
++    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&device2));
++    if (FAILED(query) || !device2) return FAILED(query) ? query : E_NOINTERFACE;
++    const HRESULT result = device2->CreatePipelineState(desc, *riid, out);
++    device2->Release();
++    return result;
+ }
+ 
+ // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
+@@ -2733,8 +2738,12 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
+     if (out) *out = nullptr;
+     if (self->slot_count <= 62) return refuse_beyond_device(101, self->slot_count);  // predates ID3D12Device5
+     if (!riid) return E_POINTER;
+-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_STATE_OBJECT_DESC*, const IID*, void**);
+-    return reinterpret_cast<Fn>(self->real_vtable[62])(self->real, desc, riid, out);
++    ID3D12Device5* device5 = nullptr;
++    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device5), reinterpret_cast<void**>(&device5));
++    if (FAILED(query) || !device5) return FAILED(query) ? query : E_NOINTERFACE;
++    const HRESULT result = device5->CreateStateObject(desc, *riid, out);
++    device5->Release();
++    return result;
+ }
+ 
+ // Xbox slot 108: GetResourceAllocationInfo2, forwarded to PC ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68).
+@@ -2796,11 +2805,16 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
+         descs_to_pass = cleaned.data();
+     }
+ 
+-    using Fn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
+-        ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
+-        D3D12_RESOURCE_ALLOCATION_INFO1*);
+-    reinterpret_cast<Fn>(proxy->real_vtable[68])(proxy->real, ret, visible_mask, count, descs_to_pass, info1);
++    ID3D12Device8* device8 = nullptr;
++    const HRESULT query = proxy->real->QueryInterface(__uuidof(ID3D12Device8), reinterpret_cast<void**>(&device8));
++    if (FAILED(query) || !device8) {
++        *ret = {UINT64_MAX, 0};
++        return reinterpret_cast<std::uint64_t>(ret);
++    }
++    *ret = device8->GetResourceAllocationInfo2(visible_mask, count, descs_to_pass, info1);
++    device8->Release();
+     return reinterpret_cast<std::uint64_t>(ret);
++}
+ 
+ // Device slot 25, GetResourceAllocationInfo, as the retail executable calls it. The measurement is the same as slot
+ // 26's, one call later (retail boot chain stop 15): the returned D3D12_RESOURCE_ALLOCATION_INFO is a 16-byte struct,
+@@ -3359,11 +3373,10 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ }
+ 
+ bool device_slot_overridden(unsigned slot) {
+-    EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(61) &&
+-           xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
+-           xs::device_slot_overridden(79) && xs::device_slot_overridden(80) &&
+-           xs::device_slot_overridden(86) && xs::device_slot_overridden(101) &&
+-           xs::device_slot_overridden(108));
++    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) ||
++        slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 ||
++        slot == 46 || slot == 50 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 ||
++        slot == 86 || slot == 101 || slot == 108 || slot == 127 || slot == 133)
+         return true;
+     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 26d6405..bdea0cd 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -157,9 +157,8 @@ unsigned device_proxy_slot_count(const void* device);
+ // The PC device behind a proxy. Null when `device` is not a proxy.
+ ID3D12Device* device_proxy_real_device(const void* device);
+ 
+-// True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
+ // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75
+-(queue proxies), 9 (allocator proxies), 14, 25 and 26 (the console's struct-return forms),
++// (queue proxies), 9 (allocator proxies), 14, 25 and 26 (the console's struct-return forms),
+ // 31/34/35/45/46/50 (unwrapped), 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at
+ // their configured indices), 62, 67, 70, 76, 86, 101, 108, 127 and 133 (the console's own forms; 86/101/108
+ // route to the PC Device2/Device5/Device8 methods of the same name). Slot 10 is intentionally false: the
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index 2ae3af4..2c524a4 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -262,7 +262,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
+     }
+     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+     if (m->kind == Kind::queue && slot == 16 && a1) {
+-        // GetTimestampFrequency writes a fixed value — unless a1 is a mock object, which on this slot is a
++        // GetTimestampFrequency writes a fixed value â€” unless a1 is a mock object, which on this slot is a
+         // newer-layout Signal's fence, not an out pointer.
+         const auto at = static_cast<std::uintptr_t>(a1);
+         const auto base = reinterpret_cast<std::uintptr_t>(g_pool);
+@@ -546,6 +546,108 @@ int check_levels() {
+     return 0;
+ }
+ 
++// One COM identity with separate base and extended-interface pointers. The base table is padded with recording
++// slots so an incorrect call through it fails a check instead of reading beyond a short vtable.
++Mock* g_device_identity = nullptr;
++Mock* g_device_extension = nullptr;
++
++HRESULT WINAPI distinct_device_query(Mock*, const IID* riid, void** out) {
++    if (!out) return E_POINTER;
++    *out = nullptr;
++    if (!riid) return E_NOINTERFACE;
++    Mock* answer = nullptr;
++    if (IsEqualIID(*riid, __uuidof(IUnknown)) || IsEqualIID(*riid, __uuidof(ID3D12Object)) ||
++        IsEqualIID(*riid, __uuidof(ID3D12Device))) {
++        answer = g_device_identity;
++    } else if (mock_has(g_device_extension, *riid)) {
++        answer = g_device_extension;
++    }
++    if (!answer) return E_NOINTERFACE;
++    ++answer->refs;
++    *out = answer;
++    return S_OK;
++}
++
++template <unsigned Slot>
++HRESULT WINAPI distinct_device_create(Mock* self, const void* desc, const IID* riid, void** out) {
++    ++self->calls[Slot];
++    self->args[Slot][0] = word(desc);
++    self->args[Slot][1] = word(riid);
++    self->args[Slot][2] = word(out);
++    if (out) *out = nullptr;
++    return self->create_result;
++}
++
++int check_distinct_device_interfaces() {
++    Mock* base = new_mock(Kind::device);
++    Mock* extension = new_mock(Kind::device);
++    base->refs = 1;
++    extension->device_level = 8;
++    g_device_identity = base;
++    g_device_extension = extension;
++    void* base_table[kMockSlots];
++    void* extension_table[kMockSlots];
++    std::memcpy(base_table, mock_vtable(), sizeof(base_table));
++    std::memcpy(extension_table, mock_vtable(), sizeof(extension_table));
++    base_table[0] = extension_table[0] = reinterpret_cast<void*>(&distinct_device_query);
++    extension_table[47] = reinterpret_cast<void*>(&distinct_device_create<47>);
++    extension_table[62] = reinterpret_cast<void*>(&distinct_device_create<62>);
++    base->vtable = base_table;
++    extension->vtable = extension_table;
++
++    // Both pointers expose the same IUnknown identity, but QI(Device8) does not return the base pointer.
++    const IID device8_iid = __uuidof(ID3D12Device8);
++    void* queried = nullptr;
++    EXPECT(hr_of(raw(base, 0, word(&device8_iid), word(&queried))) == S_OK && queried == extension);
++    void* identity = nullptr;
++    EXPECT(hr_of(raw(queried, 0, word(&kUnknownIid), word(&identity))) == S_OK && identity == base);
++    EXPECT(release(identity) == 1 && release(queried) == 0);
++
++    void* device = nullptr;
++    EXPECT(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(base), __uuidof(ID3D12Device), &device) == S_OK);
++    EXPECT(xs::device_proxy_slot_count(device) == 73 && extension->refs == 0);
++    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{};
++    D3D12_STATE_OBJECT_DESC state_desc{};
++    const IID pso_iid = __uuidof(ID3D12PipelineState), state_iid = __uuidof(ID3D12StateObject);
++    void* out = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw(device, 86, word(&stream_desc), word(&pso_iid), word(&out))) == S_OK && !out);
++    EXPECT(base->calls[47] == 0 && extension->calls[47] == 1 && extension->refs == 0);
++    EXPECT(extension->args[47][0] == word(&stream_desc) && extension->args[47][1] == word(&pso_iid));
++    out = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw(device, 101, word(&state_desc), word(&state_iid), word(&out))) == S_OK && !out);
++    EXPECT(base->calls[62] == 0 && extension->calls[62] == 1 && extension->refs == 0);
++    EXPECT(extension->args[62][0] == word(&state_desc) && extension->args[62][1] == word(&state_iid));
++
++    // A failing call still releases the QI reference and propagates the backend's HRESULT.
++    extension->create_result = E_ABORT;
++    EXPECT(hr_of(raw(device, 86, word(&stream_desc), word(&pso_iid), word(&out))) == E_ABORT);
++    EXPECT(hr_of(raw(device, 101, word(&state_desc), word(&state_iid), word(&out))) == E_ABORT);
++    EXPECT(base->calls[47] == 0 && base->calls[62] == 0 && extension->refs == 0);
++    EXPECT(extension->calls[47] == 2 && extension->calls[62] == 2);
++
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    desc.Width = 4096;
++    desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
++    D3D12_RESOURCE_ALLOCATION_INFO allocation{};
++    EXPECT(raw(device, 108, word(&allocation), 1, 1, word(&desc), 0) == word(&allocation));
++    EXPECT(allocation.SizeInBytes == 0x40000 && allocation.Alignment == 0x10000);
++    EXPECT(base->calls[68] == 0 && extension->calls[68] == 1 && extension->refs == 0);
++    EXPECT(extension->array[68][0] == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
++    using CAbiAllocationFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(
++        D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT, const D3D12_RESOURCE_DESC*,
++        D3D12_RESOURCE_ALLOCATION_INFO1*);
++    const auto table = *reinterpret_cast<void* const* const*>(device);
++    allocation = {};
++    EXPECT(reinterpret_cast<CAbiAllocationFn>(table[108])(&allocation, device, 1, 1, &desc, nullptr) == &allocation);
++    EXPECT(allocation.SizeInBytes == 0x40000 && allocation.Alignment == 0x10000);
++    EXPECT(base->calls[68] == 0 && extension->calls[68] == 2 && extension->refs == 0);
++    EXPECT(release(device) == 0 && base->refs == 0);
++    g_device_identity = g_device_extension = nullptr;
++    std::printf("%s: slots 86/101/108 use distinct QI pointers, preserve results and balance references\n", g_label);
++    return 0;
++}
++
+ // ---- 2. Fences with and without ID3D12Fence1 ----
+ 
+ int check_fence1() {
+@@ -1260,7 +1362,7 @@ int check_lists() {
+     const IID device_iid = __uuidof(ID3D12Device);
+     EXPECT(hr_of(raw(list, 7, word(&device_iid), word(&found))) == S_OK && found == device);
+     EXPECT(release(found) >= 1);
+-    // A forwarded console slot: Dispatch is console 14 (PC slot 14 too — order holds through 26).
++    // A forwarded console slot: Dispatch is console 14 (PC slot 14 too â€” order holds through 26).
+     EXPECT(hr_of(raw(list, 14, 1, 1, 1)) == S_OK && real->calls[14] == 1);
+     // Console-only extras (27-30) and the unmeasured tail are recorded and return 0, never forwarded.
+     EXPECT(raw(list, 27, 1, 2, 3, 4) == 0 && real->calls[27] == 0);
+@@ -1275,7 +1377,7 @@ int check_lists() {
+     EXPECT(raw(list, 148, ~0ull, 16) == 0);
+     EXPECT(raw(list, 148, 16, 48) == 0);
+     const std::uint64_t p3 = raw(list, 148, 16, 16);
+-    EXPECT(p3 && p3 == p2 + 16);  // fresh memory right after p2 — both refusals left the cursor alone
++    EXPECT(p3 && p3 == p2 + 16);  // fresh memory right after p2 â€” both refusals left the cursor alone
+     // Console 43 -> PC 39 (SetComputeRootShaderResourceView): the arena pointer crosses as a GPU VA (the mock
+     // device cannot map a real buffer, so the fallback arena translates to the same address).
+     EXPECT(hr_of(raw(list, 43, 0, p1)) == S_OK && real->calls[39] == 1 && real->args[39][1] == p1);
+@@ -1306,7 +1408,7 @@ int check_lists() {
+ // ---- 10. SignalX layout detection ------------------------------------------------------------
+ // A fence at queue slot 25 while the layout is still unknown is itself the newer-layout evidence: a title that
+ // signals only through SignalX never reaches Signal/Wait at 16/17, so an unanswered SignalX used to return
+-// S_OK having signalled nothing — a waiter on that fence value then hangs (shdann's report on #2490: the first
++// S_OK having signalled nothing â€” a waiter on that fence value then hangs (shdann's report on #2490: the first
+ // SignalX gave hr=0 calls=0, the value was lost).
+ 
+ int check_signalx_detection() {
+@@ -1336,7 +1438,7 @@ int check_signalx_detection() {
+     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
+ 
+     // Proven older stays older: a non-fence at slot 16 pins the older layout (the frequency getter), and a
+-    // fence at 25 afterwards is an unmodelled console method — S_OK with no forward, not a second detection.
++    // fence at 25 afterwards is an unmodelled console method â€” S_OK with no forward, not a second detection.
+     Mock* mock2 = nullptr;
+     void* device2 = make_device(mock2, 9, true);
+     void* queue3 = make_queue(device2);
+@@ -1367,7 +1469,7 @@ int check_signalx_detection() {
+     EXPECT(release(queue4) == 0 && release(fence4) == 0 && release(device3) == 0 && mock3->refs == 0);
+ 
+     // Ambiguous slot 18 on an undetected queue: the older GetDesc or the newer frequency getter. It is
+-    // served as the frequency query — a desc write is far wider than the 8 bytes a frequency caller
++    // served as the frequency query â€” a desc write is far wider than the 8 bytes a frequency caller
+     // passes (a title often reads the frequency before its first fence call); once a fence proves the
+     // layout the same call keeps reaching the getter through the shifted path.
+     Mock* mock4 = nullptr;
+@@ -1534,7 +1636,7 @@ int check_tail(bool want_guarded) {
+     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
+            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
+-    // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
++    // refusing: frame pacing flows through them. Nothing is forwarded â€” the real queue never sees them.
+     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+         EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
+     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+@@ -1816,7 +1918,8 @@ int main(int argc, char** argv) {
+         return run_fault_mode(argv[1]);
+     }
+     if (argc != 1) return 2;
+-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
++    if (check_tail(true) || check_levels() || check_distinct_device_interfaces() || check_fence1() ||
++        check_create_failures() || check_open_shared() ||
+         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties() ||
+         check_descriptor_heap_hooks() || check_lists() || check_signalx_detection() || check_slot70() ||
+         check_slot70_raw_buffer() || check_list_tail_names())
