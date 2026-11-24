@@ -1,0 +1,74 @@
+; GTA6 engine vertex shader (hand-written SPIR-V assembly).
+; Inputs: location 0 = position, 1 = normal, 2 = uv.
+; Push constants: mat4 mvp (offset 0), mat4 model (offset 64).
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %in_pos %in_nrm %in_uv %o_nrm %o_uv %o_world %gl_pos
+               OpName %main "main"
+               OpName %pc "pc"
+               OpMemberName %pc 0 "mvp"
+               OpMemberName %pc 1 "model"
+               OpDecorate %in_pos Location 0
+               OpDecorate %in_nrm Location 1
+               OpDecorate %in_uv Location 2
+               OpDecorate %o_nrm Location 0
+               OpDecorate %o_uv Location 1
+               OpDecorate %o_world Location 2
+               OpDecorate %gl_pos BuiltIn Position
+               OpDecorate %pc Block
+               OpMemberDecorate %pc 0 ColMajor
+               OpMemberDecorate %pc 0 MatrixStride 16
+               OpMemberDecorate %pc 0 Offset 0
+               OpMemberDecorate %pc 1 ColMajor
+               OpMemberDecorate %pc 1 MatrixStride 16
+               OpMemberDecorate %pc 1 Offset 64
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %v2f = OpTypeVector %float 2
+        %v3f = OpTypeVector %float 3
+        %v4f = OpTypeVector %float 4
+       %mat4 = OpTypeMatrix %v4f 4
+         %pc = OpTypeStruct %mat4 %mat4
+   %ptr_pcmat = OpTypePointer PushConstant %mat4
+      %ptr_pc = OpTypePointer PushConstant %pc
+   %ptr_in3 = OpTypePointer Input %v3f
+   %ptr_in2 = OpTypePointer Input %v2f
+  %ptr_out3 = OpTypePointer Output %v3f
+  %ptr_out2 = OpTypePointer Output %v2f
+  %ptr_pos = OpTypePointer Output %v4f
+      %uint = OpTypeInt 32 0
+     %uint0 = OpConstant %uint 0
+     %uint1 = OpConstant %uint 1
+    %float0 = OpConstant %float 0
+    %float1 = OpConstant %float 1
+      %pcv = OpVariable %ptr_pc PushConstant
+    %in_pos = OpVariable %ptr_in3 Input
+    %in_nrm = OpVariable %ptr_in3 Input
+     %in_uv = OpVariable %ptr_in2 Input
+      %o_nrm = OpVariable %ptr_out3 Output
+       %o_uv = OpVariable %ptr_out2 Output
+    %o_world = OpVariable %ptr_out3 Output
+     %gl_pos = OpVariable %ptr_pos Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %mptr0 = OpAccessChain %ptr_pcmat %pcv %uint0
+        %mvp = OpLoad %mat4 %mptr0
+      %mptr1 = OpAccessChain %ptr_pcmat %pcv %uint1
+      %model = OpLoad %mat4 %mptr1
+         %p3 = OpLoad %v3f %in_pos
+         %n3 = OpLoad %v3f %in_nrm
+         %uv = OpLoad %v2f %in_uv
+         %p4 = OpCompositeConstruct %v4f %p3 %float1
+         %n4 = OpCompositeConstruct %v4f %n3 %float0
+       %clip = OpMatrixTimesVector %v4f %mvp %p4
+     %world4 = OpMatrixTimesVector %v4f %model %p4
+      %norm4 = OpMatrixTimesVector %v4f %model %n4
+     %world3 = OpVectorShuffle %v3f %world4 %world4 0 1 2
+      %norm3 = OpVectorShuffle %v3f %norm4 %norm4 0 1 2
+               OpStore %gl_pos %clip
+               OpStore %o_world %world3
+               OpStore %o_nrm %norm3
+               OpStore %o_uv %uv
+               OpReturn
+               OpFunctionEnd
