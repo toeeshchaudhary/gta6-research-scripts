@@ -2799,21 +2799,202 @@
       "path": "archive/traces/work/astra/signature-mock.log.gz",
       "sha256": "1bf993b303ed2c6d7e9c1d78de9278dc28b5f1ddffbdda6d7e9fb323037b109a",
       "bytes": 4286
+    },
+    {
+      "path": "archive/traces/work/astra/boot-A-device-proxy-test.log.gz",
+      "bytes": 3124,
+      "sha256": "0c0f1c919d7df52fc19d243c3abfa68c3fe8a0b648912655266a490ab4c15012"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-A-mock.log.gz",
+      "bytes": 4286,
+      "sha256": "384a56e919e4e4fb066f4166996e66c49233827b4606ab2359f59567ced283be"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-FINAL-dpt.log.gz",
+      "bytes": 3270,
+      "sha256": "018d284016ea9312e5d9f3f9ba0aa1567cd41c0ecbc8709ee86644b68e89c61d"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-FINAL-mock.log.gz",
+      "bytes": 4487,
+      "sha256": "a852f405115f6bd1fa25fcab776a55f87f16633be158ca822ef8b2e6368f3d87"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-M-device-proxy-test.log.gz",
+      "bytes": 3275,
+      "sha256": "542c219dc2d388b85a0384b64df41b381d0d0133a7c01ac1dd1290f861f8d25b"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-M-dpt2.log.gz",
+      "bytes": 2386,
+      "sha256": "0bb8151370087295e4f3a241fb70d971e308bf6386eab98fd909a3a8843eb2c6"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-M-mock.log.gz",
+      "bytes": 4505,
+      "sha256": "f40bda0b282657276a288445945da58873bac58160aa5c7056d16d260001d7a8"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-dev5-device-test2.log.gz",
+      "bytes": 5844,
+      "sha256": "ad2cf0a8e890ab5915442e9b81876044de01744208be42bb14ed9f0656ba1ec6"
+    },
+    {
+      "path": "archive/traces/work/astra/boot-dev5-vulkan-device-test.log.gz",
+      "bytes": 5808,
+      "sha256": "ddeb5876c5460bd8fed1c0bcb2c3f5879b049ed53641000dab42a89c06e59c00"
+    },
+    {
+      "path": "archive/traces/work/astra/ctl-A-device-test.log.gz",
+      "bytes": 5473,
+      "sha256": "b06e307aeb687e32a007af387fae0826e069ab9bba901deb749bb140a64c732c"
+    },
+    {
+      "path": "archive/traces/work/astra/ctl-A-dpt.log.gz",
+      "bytes": 3140,
+      "sha256": "aea0e71144d0017fac68960951d7beaab02b5b349d18ce4c5a3f10fe3c9c28ef"
+    },
+    {
+      "path": "archive/traces/work/astra/ctl-B-dpt.log.gz",
+      "bytes": 3286,
+      "sha256": "f483ecde7c5f5ac32b21c6a4997c2061e7a0db0e6569714c482e629f954a23cc"
+    },
+    {
+      "path": "archive/traces/work/astra/make-shaders.log.gz",
+      "bytes": 2521,
+      "sha256": "6ffcb5739c8368b11aa9bfe90c0f68e4afc6360180dcd72cabaf70221ed45df0"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/acphal.c",
+      "bytes": 2280,
+      "sha256": "65f1d02ca7db8f55b43eddabaa252d1732342e41e6c1d148d0fd09edeacb6239"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/acphal.def",
+      "bytes": 221,
+      "sha256": "8fe6b6f8084ceb50be158a70fe119107054958f90de7a0fb78b98a57ec7d9f88"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/chad.c",
+      "bytes": 1304,
+      "sha256": "22de8bb6a931f556aa81653a739e4226ce81de910e10167aba175bbc734ced7e"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/chad.def",
+      "bytes": 136,
+      "sha256": "b2c516fcc9c0b54f63d8a9bb589903e37a0e4b74577b5bb419ab19438462b62c"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/d3d12_xs.c",
+      "bytes": 4793,
+      "sha256": "1a21fd07efaab443bc306f37f4d8d1f598fee30d1d7af3a6c964e30cb56de1d2"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/d3d12_xs.def",
+      "bytes": 166,
+      "sha256": "437cbd9683e93d57f88276324186409ae13c1d3043330b577b8ea06b488a863e"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/peload.cpp",
+      "bytes": 8280,
+      "sha256": "b9e550d9a4fd00781195da59caeaad764c96456fcaaa573600640cf5dd3aaccc"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/pe_classify.cpp",
+      "bytes": 3819,
+      "sha256": "7988d6eaedf056d2397a35a1778a311fc0f7f512288bf73bd2ad5e6aaec1eddf"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/pe_image.h",
+      "bytes": 6627,
+      "sha256": "c0519f6da9b767c1f3f213ad48bd522572d68add87db3f73748d2efd0ad65857"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/pe_map.cpp",
+      "bytes": 26550,
+      "sha256": "821b1b06a0ceed3c5c6b3a73b0f141d1262ba672db04965208755c1317e46fca"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/pe_parse.cpp",
+      "bytes": 21377,
+      "sha256": "9146508dcf29d70b414d391b9045288f1fc2d7082f62f2bcd7512587b24e9286"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/shim.cpp",
+      "bytes": 6930,
+      "sha256": "1c4d709cfa967a6111b235d0b7306db3988397275ed31cd1a67455985c24ea06"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/shim.h",
+      "bytes": 1089,
+      "sha256": "05877268ff71a3e12460850e7750148378ded5e41e91a2c59f8cf08109d9d763"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/shims2.h",
+      "bytes": 2728,
+      "sha256": "d4fe59a46a5e4b37a79fcb96d429d1243a11d022a54c0616ca21e2be986eb6f9"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xapu.c",
+      "bytes": 1280,
+      "sha256": "f7b546d2f70362d09108e71ac11b608297da2373c1343378d4c23df43f29b7b0"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xapu.def",
+      "bytes": 124,
+      "sha256": "0cee2a8069f83a016ecb42ec95c4bde55e9d2cdd3076bad2737928dbb2e712a9"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xcrdapi.c",
+      "bytes": 331,
+      "sha256": "271df47fafe0a57255a59ed3bc3c3cbdae743dd33c8e660edb7054918f913712"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xcrdapi.def",
+      "bytes": 47,
+      "sha256": "17986baac5fab226608a02681a3ae78e7963bb08f55b08b09cbb1cb645ddfb8b"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xg_xs.c",
+      "bytes": 588,
+      "sha256": "6415deb9bba31cb37fde053ca553aca975ab4d96ad5e9104af4fc66273a97c89"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xg_xs.def",
+      "bytes": 75,
+      "sha256": "c9cd8a594038797510adbe411b1d1447227fbf8ec7253f570af0531b8d4e8a95"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xmem.c",
+      "bytes": 8645,
+      "sha256": "09a609880a69a4ad845b6b9b2ee2a8a2c6f6d922437017667fa3f906ac614e4e"
+    },
+    {
+      "path": "archive/boot/work/d3d12/B/src/xmem.def",
+      "bytes": 366,
+      "sha256": "dee1fadf22b8ba09675eaba822df9f665c199ef9bd72461ba2013f017e2e78a0"
+    },
+    {
+      "path": "archive/patches/sampler-series/8c2b0863c378722e2e2dc9eed7fcbc642a06c94b.patch",
+      "bytes": 22863,
+      "sha256": "4c30d703c135135e6cb5807cfd01dfdda14e437609d5861e419952d6530dfd1d"
+    },
+    {
+      "path": "archive/patches/sampler-series/c8920b7a4c48687ba40ae881667c0eced33c9580.patch",
+      "bytes": 10772,
+      "sha256": "25165b846c1b94ac5a2428df14248ee4a3d985cc4a12af2fe2cb690cdd0de07c"
+    },
+    {
+      "path": "archive/patches/sampler-series/736b0f2cd46724da5a9bef6cdc655b993d9fd871.patch",
+      "bytes": 15979,
+      "sha256": "007fd785bd0b7b09c1d544cf71731634eeaae23cb63c44efe8fc189a5f75c256"
+    },
+    {
+      "path": "archive/patches/sampler-series/a989b11c26c5daec8b01ee5de38a8e2959337727.patch",
+      "bytes": 13208,
+      "sha256": "ff2afec944a3923ce51b719f0fb7055be3f1ecf1935da41b746b7a4c24825820"
     }
   ],
-  "skipped": [
-    "work\\astra\\boot-A-device-proxy-test.log",
-    "work\\astra\\boot-A-mock.log",
-    "work\\astra\\boot-FINAL-dpt.log",
-    "work\\astra\\boot-FINAL-mock.log",
-    "work\\astra\\boot-M-device-proxy-test.log",
-    "work\\astra\\boot-M-dpt2.log",
-    "work\\astra\\boot-M-mock.log",
-    "work\\astra\\boot-dev5-device-test2.log",
-    "work\\astra\\boot-dev5-vulkan-device-test.log",
-    "work\\astra\\ctl-A-device-test.log",
-    "work\\astra\\ctl-A-dpt.log",
-    "work\\astra\\ctl-B-dpt.log",
-    "work\\astra\\make-shaders.log"
-  ]
+  "skipped": []
 }

@@ -1,0 +1,161 @@
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index f904c6e..f201766 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -257,6 +257,7 @@ const char* slot_name(unsigned slot) {
+         case 34: return "MakeResident (proxies unwrapped)";
+         case 35: return "Evict (proxies unwrapped)";
+         case 36: return "CreateFence -> fence proxy";
++        case 41: return "CreateCommandSignature (Xbox argument type 105 as DISPATCH)";
+         case 43: return "GetAdapterLuid";
+         case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
+         case 46: return "SetResidencyPriority (proxies unwrapped)";
+@@ -2602,6 +2603,57 @@ void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, s
+     self->real->CreateSampler(desc, translate_cpu_handle(self, handle));
+ }
+ 
++// The Xbox slot 41 is CreateCommandSignature at its PC position, (desc, root signature, riid, out), but a console
++// description can hold an argument type the PC does not have. The retail title creates five one-argument signatures
++// with no root signature at startup; one has type 105 (0x69) and a 12-byte stride, next to a DISPATCH and a
++// DISPATCH_MESH of 12 bytes. Read statically from its call sites (counts and shapes only): its two ExecuteIndirect
++// sites pass MaxCommandCount 1 and an argument offset into the same upload buffer as the DISPATCH ones, and set the
++// compute state (pipeline, compute root signature, tables, constants, SRV/UAV) right before, as the DISPATCH path
++// does; they record on a second command list of the title's context. So type 105 is taken as a dispatch whose
++// arguments are a D3D12_DISPATCH_ARGUMENTS. HYPOTHESIS: what the console does differently for it (which command
++// stream it feeds) is not known; the PC layer has one compute path. Other descriptions are forwarded unchanged.
++// 105 is outside D3D12_INDIRECT_ARGUMENT_TYPE's range, so the field is read as its 32 bits (a constant expression that
++// casts 105 to the enum does not compile with clang-cl).
++constexpr std::uint32_t kXboxIndirectArgumentDispatch105 = 105;
++
++std::uint32_t argument_type(const D3D12_INDIRECT_ARGUMENT_DESC& arg) {
++    std::uint32_t type = 0;
++    std::memcpy(&type, &arg.Type, sizeof(type));
++    return type;
++}
++
++HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
++                                       std::uint64_t root_signature, const IID* riid, void** out) {
++    note_slot(41);
++    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, std::uint64_t,
++                                           const IID*, void**);
++    const auto forward = reinterpret_cast<Fn>(self->real_vtable[41]);
++    bool console = false;
++    if (desc && desc->pArgumentDescs)
++        for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
++            console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
++    if (!console) return forward(self->real, desc, root_signature, riid, out);
++
++    std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args(new (std::nothrow)
++                                                             D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
++    if (!args) {
++        if (out) *out = nullptr;
++        return E_OUTOFMEMORY;
++    }
++    for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
++        args[i] = desc->pArgumentDescs[i];
++        if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
++            args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
++    }
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true, std::memory_order_relaxed))
++        std::fprintf(stderr, "[rt] d3d12_xs: slot 41 argument type 105 (stride %u) created as DISPATCH\n",
++                     desc->ByteStride);
++    D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
++    pc.pArgumentDescs = args.get();
++    return forward(self->real, &pc, root_signature, riid, out);
++}
++
+ // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
+ // DeserializeComputePipelineStateX in amd_fidelityfx_upscaler_xbox.dll's messages (call at RVA 0x56d9). The desc
+ // passes the root signature at +0x00, followed by pointer/size pairs for the shader's FSPX entries (docs/fspx.md):
+@@ -3098,6 +3150,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+         return hr_to_u64(proxy_create_compute_pipeline_state(
+             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
+             reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
++    } else if constexpr (Slot == 41) {
++        return hr_to_u64(proxy_create_command_signature(
++            self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
++            reinterpret_cast<void**>(a4)));
+     } else if constexpr (Slot == 61) {
+         if (is_console_caller(_ReturnAddress())) {
+             proxy_create_sampler_x(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1), a2);
+@@ -3334,7 +3390,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ 
+ bool device_slot_overridden(unsigned slot) {
+     if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) ||
+-        slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 45 ||
++        slot == 25 || slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 ||
+         slot == 46 || slot == 50 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 75 || slot == 76 ||
+         slot == 127 || slot == 133)
+         return true;
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 39de6d3..1dedb66 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -12,6 +12,8 @@
+ //             PC form: no call of it has been seen.
+ //   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
+ //             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's boot.
++//   slot 41   CreateCommandSignature at its PC position; a console argument of type 105 (a 12-byte dispatch, read
++//             from the retail title's call sites) is created as D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.
+ //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
+ //             before the IID. The PC slot 62 is CreateStateObject.
+ //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index b41756d..94231ad 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -240,6 +240,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
+                 out->VisibleNodeMask = kHeapMarker;
+                 return a1;  // a struct-returning method hands the buffer's address back in RAX
+             }
++            case 41:                                                        // CreateCommandSignature(desc, ...)
++                if (const auto* desc = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1)) {
++                    m->array[41][0] = desc->ByteStride | std::uint64_t{desc->NumArgumentDescs} << 32;
++                    for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i) {
++                        std::uint32_t type = 0;  // read as its 32 bits: a console type is outside the enum's range
++                        std::memcpy(&type, &desc->pArgumentDescs[i].Type, sizeof(type));
++                        m->array[41][i + 1] = type;
++                    }
++                }
++                break;
+             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
+             default: break;
+         }
+@@ -1002,7 +1012,35 @@ int check_xbox_slots() {
+     EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1);
+     xs::set_console_caller(nullptr);
+ 
+-    EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(61) && xs::device_slot_overridden(73) &&
++    // 41 CreateCommandSignature: a console argument of type 105 reaches the PC slot 41 as DISPATCH, in a copy of the
++    // description (stride, count, the root argument before it and the root signature kept). A PC description is
++    // passed as the same pointer.
++    D3D12_INDIRECT_ARGUMENT_DESC console_args[2]{};
++    console_args[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
++    console_args[0].Constant.Num32BitValuesToSet = 1;
++    constexpr std::uint32_t kType105 = 105;  // outside the enum's range: written and read as its 32 bits
++    std::memcpy(&console_args[1].Type, &kType105, sizeof(kType105));
++    const D3D12_COMMAND_SIGNATURE_DESC console_sig{16, 2, console_args, 0};
++    const IID sig_iid = __uuidof(ID3D12CommandSignature);
++    void* sig = nullptr;
++    EXPECT(hr_of(raw(device, 41, word(&console_sig), 0x5150, word(&sig_iid), word(&sig))) == S_OK);
++    EXPECT(mock->calls[41] == 1 && xs::device_slot_hits(41) == 1);
++    EXPECT(mock->args[41][0] != word(&console_sig) && mock->args[41][1] == 0x5150);
++    EXPECT(mock->args[41][2] == word(&sig_iid) && mock->args[41][3] == word(&sig));
++    EXPECT(mock->array[41][0] == (16 | std::uint64_t{2} << 32));
++    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT &&
++           mock->array[41][2] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
++    std::uint32_t caller_type = 0;
++    std::memcpy(&caller_type, &console_args[1].Type, sizeof(caller_type));
++    EXPECT(caller_type == kType105);  // the caller's description is untouched
++    D3D12_INDIRECT_ARGUMENT_DESC pc_arg{};
++    pc_arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
++    const D3D12_COMMAND_SIGNATURE_DESC pc_sig{12, 1, &pc_arg, 0};
++    EXPECT(hr_of(raw(device, 41, word(&pc_sig), 0, word(&sig_iid), word(&sig))) == S_OK);
++    EXPECT(mock->calls[41] == 2 && mock->args[41][0] == word(&pc_sig));
++    EXPECT(mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
++
++    EXPECT(xs::device_slot_overridden(41) && xs::device_slot_overridden(61) && xs::device_slot_overridden(48) && xs::device_slot_overridden(73) &&
+            xs::device_slot_overridden(78) && xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
+ 
+     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);

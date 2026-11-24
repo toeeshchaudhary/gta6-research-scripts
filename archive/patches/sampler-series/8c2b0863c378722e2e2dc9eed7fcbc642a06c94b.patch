@@ -1,0 +1,352 @@
+diff --git a/runtime/shims/d3d12_com.cpp b/runtime/shims/d3d12_com.cpp
+index 005c37e..aae37ad 100644
+--- a/runtime/shims/d3d12_com.cpp
++++ b/runtime/shims/d3d12_com.cpp
+@@ -823,6 +823,11 @@ public:
+         UINT stride = 0;
+         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+             return check(false);
++        // A mesh dispatch runs on a direct list only: the host's Close fails after one on a compute or a copy list
++        // (the list-type rows of d3d12_execute_indirect_validation_test, MaxCommandCount 0 among them, measured on
++        // WARP and an RX 5700, AMD driver 32.0.21045.29003).
++        if (kind == leonida::IndirectKind::dispatch_mesh && type_ != D3D12_COMMAND_LIST_TYPE_DIRECT)
++            return check(false);
+         const auto arg_desc = argument_buffer->GetDesc();
+         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
+             return check(false);
+@@ -839,6 +844,7 @@ public:
+                 kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
+                 : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
+                 : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
++                : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
+                 : 0;
+             if (!record_size || stride < record_size || stride % 4 != 0)
+                 return check(false);
+@@ -859,6 +865,21 @@ public:
+             cmd.pipeline = compute_pipeline_;
+             cmd.user_data = compute_user_data();
+         }
++        if (kind == leonida::IndirectKind::dispatch_mesh) {
++            // Last, after the list type and every check the other kinds get (both buffers, their alignment and the
++            // argument-buffer bounds, with 12-byte records), so Close answers as the host's does: the DISPATCH_MESH
++            // rows of d3d12_execute_indirect_validation_test, measured on WARP and an RX 5700 (AMD driver
++            // 32.0.21045.29003). As for a draw, no pipeline or root signature has to be bound; the host's Close is
++            // S_OK without them too. Not replayed yet (#3777 replays it as vkCmdDrawMeshTasksIndirectEXT): nothing
++            // is recorded, the first such call says so, and the list stays valid. A device without mesh shaders has
++            // these signatures too (CreateCommandSignature creates them on every device), but no mesh PSO to run
++            // them with.
++            static std::atomic<bool> logged{false};
++            if (!logged.exchange(true, std::memory_order_relaxed))
++                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with a DISPATCH_MESH signature is not replayed yet; "
++                                     "nothing was recorded\n");
++            return;
++        }
+         check(list_.execute_indirect(cmd));
+     }
+ 
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 146192a..8b44725 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -5651,6 +5651,13 @@ public:
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
++        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
++            // Created on every device, with or without mesh shaders. Measured on an RX 5700 without them
++            // (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818), which answers S_OK with the
++            // debug layer on too, and on WARP; d3d12_vulkan_device_test compares this answer with the host's live.
++            // Only mesh PSOs need VK_EXT_mesh_shader.
++            kind = leonida::IndirectKind::dispatch_mesh;
++            break;
+         default: return E_NOTIMPL;
+         }
+         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+diff --git a/runtime/src/command_list.h b/runtime/src/command_list.h
+index 0d5ae92..e1974ad 100644
+--- a/runtime/src/command_list.h
++++ b/runtime/src/command_list.h
+@@ -587,6 +587,11 @@ enum class IndirectKind : std::uint8_t {
+     draw = 0,
+     draw_indexed = 1,
+     dispatch = 2,
++    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on every device, with or without mesh shaders, as the host runtime does on
++    // an RX 5700 without them (AMD driver 32.0.21045.29003) and on WARP (measured). ExecuteIndirect checks it as it
++    // checks a draw and then records nothing yet (the replay is #3777's), so a title that only creates such a
++    // signature at startup goes on.
++    dispatch_mesh = 3,
+ };
+ 
+ struct ExecuteIndirect {
+diff --git a/runtime/test/d3d12_execute_indirect_validation_test.cpp b/runtime/test/d3d12_execute_indirect_validation_test.cpp
+index 03f61f1..73ae78c 100644
+--- a/runtime/test/d3d12_execute_indirect_validation_test.cpp
++++ b/runtime/test/d3d12_execute_indirect_validation_test.cpp
+@@ -1,6 +1,7 @@
+ // Host-parity validation and GPU execution sanity test for ID3D12GraphicsCommandList::ExecuteIndirect.
+ // Compares Close() verdicts between the Vulkan layer, live Windows WARP, and live hardware D3D12 (0 disagreements),
+-// then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
++// then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. The cases cover draw,
++// draw-indexed, dispatch and DISPATCH_MESH signatures, and DISPATCH_MESH on compute and copy lists. No game data.
+ #include "vk_test_device.h"
+ #include "d3d12_test_shaders.h"
+ #include "host_wine.h"
+@@ -59,6 +60,8 @@ struct Env {
+     Ref<ID3D12CommandSignature> draw_indexed24;
+     Ref<ID3D12CommandSignature> dispatch12;
+     Ref<ID3D12CommandSignature> dispatch20;
++    Ref<ID3D12CommandSignature> mesh12;
++    Ref<ID3D12CommandSignature> mesh16;
+     Ref<ID3D12RootSignature> empty_root;
+     Ref<ID3D12PipelineState> compute_pso;
+     ID3D12GraphicsCommandList* list = nullptr;
+@@ -100,6 +103,10 @@ struct Env {
+         CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, 24, draw_indexed24));
+         CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 12, dispatch12));
+         CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 20, dispatch20));
++        // Every device creates these, with or without mesh shaders: the layer device here has none, and WARP
++        // (MeshShaderTier 1) and an RX 5700 (MeshShaderTier 0, AMD driver 32.0.21045.29003) both create them.
++        CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, 12, mesh12));
++        CHECK(mksig(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, 16, mesh16));
+ 
+         if (layer_cs_container) {
+             D3D12_VERSIONED_ROOT_SIGNATURE_DESC rs_desc{};
+@@ -125,16 +132,19 @@ struct Env {
+ 
+ struct Case {
+     const char* name;
+-    bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
++    // The host's Close result. The rows before the DISPATCH_MESH ones were measured on Windows 11 WARP and an RTX 5090;
++    // the DISPATCH_MESH rows, on direct, compute and copy lists, on Windows 11 WARP and an AMD Radeon RX 5700 (AMD
++    // driver 32.0.21045.29003), which agrees with every row.
++    bool expected_ok;
+     std::function<void(Env&)> record;
++    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;  // the list the case records and closes
+ };
+ 
+ bool run_case(Env& env, const Case& c, HRESULT& out_hr) {
+     Ref<ID3D12CommandAllocator> alloc;
+     Ref<ID3D12GraphicsCommandList> list;
+-    CHECK(SUCCEEDED(env.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p))));
+-    CHECK(SUCCEEDED(env.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr,
+-                                                  IID_PPV_ARGS(&list.p))));
++    CHECK(SUCCEEDED(env.device->CreateCommandAllocator(c.list_type, IID_PPV_ARGS(&alloc.p))));
++    CHECK(SUCCEEDED(env.device->CreateCommandList(0, c.list_type, alloc.p, nullptr, IID_PPV_ARGS(&list.p))));
+     env.list = list.p;
+     c.record(env);
+     env.list = nullptr;
+@@ -263,6 +273,53 @@ std::vector<Case> parity_cases() {
+          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, 0, e.buf3.p, 0); }},
+         {"count_buf width=3 off=0 (max=0)", false,
+          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 0, e.buf3.p, 0); }},
++
++        // DISPATCH_MESH (12-byte D3D12_DISPATCH_MESH_ARGUMENTS records). The layer records nothing for these yet, but
++        // checks them as it checks a draw; no PSO or root signature is bound, as in the draw rows. These rows and
++        // the list-type rows below were measured on Windows 11 WARP (MeshShaderTier 1) and an AMD Radeon RX 5700
++        // (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818), not on the RTX 5090.
++        {"mesh max=1 arg=0 cnt=null", true,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, nullptr, 0); }},
++        {"mesh max=1 arg=0 cnt=buf@0", true,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, e.count256.p, 0); }},
++        {"mesh arg_offset=244 exact fit (244+12==256)", true,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 244, nullptr, 0); }},
++        {"mesh arg_offset=248 OOB (248+12>256, max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 248, nullptr, 0); }},
++        {"mesh arg_offset=256 ==width (max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 256, nullptr, 0); }},
++        {"mesh arg_offset=260 >width (max=0 no-op)", true,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 0, e.buf256.p, 260, nullptr, 0); }},
++        {"mesh arg_offset=240 max=2 (OOB)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 2, e.buf256.p, 240, nullptr, 0); }},
++        {"mesh arg_offset=0 max=U32MAX (OOB)", false,
++         [=](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, kU32Max, e.buf256.p, 0, nullptr, 0); }},
++        {"mesh arg_buf width=3 (max=1 OOB)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf3.p, 0, nullptr, 0); }},
++        {"mesh arg_buf width=3 (max=0 no-op)", true,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 0, e.buf3.p, 0, nullptr, 0); }},
++        {"mesh stride=16 off=228 max=2 (228+16+12==256)", true,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh16.p, 2, e.buf256.p, 228, nullptr, 0); }},
++        {"mesh stride=16 off=232 max=2 (232+16+12>256)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh16.p, 2, e.buf256.p, 232, nullptr, 0); }},
++        {"mesh argument_buffer is texture (max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.tex.p, 0, nullptr, 0); }},
++        {"mesh arg_offset=2 unaligned (max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 2, nullptr, 0); }},
++        {"mesh count_offset=256 ==width (max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, e.count256.p, 256); }},
++
++        // List type: a mesh dispatch needs a direct list; the host's Close fails after one on a compute or a copy list
++        // (measured on the same two devices as the rows above).
++        {"mesh on a compute list (max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, nullptr, 0); },
++         D3D12_COMMAND_LIST_TYPE_COMPUTE},
++        {"mesh on a compute list (max=0)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 0, e.buf256.p, 0, nullptr, 0); },
++         D3D12_COMMAND_LIST_TYPE_COMPUTE},
++        {"mesh on a copy list (max=1)", false,
++         [](Env& e) { e.list->ExecuteIndirect(e.mesh12.p, 1, e.buf256.p, 0, nullptr, 0); },
++         D3D12_COMMAND_LIST_TYPE_COPY},
+     };
+ }
+ 
+@@ -418,6 +475,14 @@ int main() {
+                     char name_buf[256]{};
+                     std::snprintf(name_buf, sizeof(name_buf), "%ls", desc.Description);
+                     hw_name = name_buf;
++                    // The user-mode driver's version, so the log names the driver the HW column was measured on.
++                    LARGE_INTEGER umd{};
++                    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
++                        std::snprintf(name_buf, sizeof(name_buf), " (driver %u.%u.%u.%u)",
++                                      unsigned(HIWORD(umd.HighPart)), unsigned(LOWORD(umd.HighPart)),
++                                      unsigned(HIWORD(umd.LowPart)), unsigned(LOWORD(umd.LowPart)));
++                        hw_name += name_buf;
++                    }
+                     hw_ran = true;
+                     break;
+                 }
+diff --git a/runtime/test/d3d12_mesh_test.cpp b/runtime/test/d3d12_mesh_test.cpp
+index df430c1..309cc51 100644
+--- a/runtime/test/d3d12_mesh_test.cpp
++++ b/runtime/test/d3d12_mesh_test.cpp
+@@ -1,7 +1,10 @@
+ // D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh, through the Xbox-ABI proxy over the Vulkan
+ // device (docs/d3d12_vulkan.md section 5, "Pipelines").
+ //   - A device without VK_EXT_mesh_shader reports D3D12_MESH_SHADER_TIER_NOT_SUPPORTED and refuses a mesh PSO with
+-//     E_NOTIMPL; that part runs on every GPU. The rest needs the extension (exit 77 without it).
++//     E_NOTIMPL. It still creates a DISPATCH_MESH command signature, as the host runtime does on an RX 5700 without
++//     mesh shaders (AMD driver 32.0.21045.29003) and on WARP (measured), and a direct list with ExecuteIndirect on it
++//     closes, runs and is waited on: the device is not removed and the run is validation-clean. That part runs on
++//     every GPU. The rest needs the extension (exit 77 without it).
+ //   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
+ //     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
+ //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
+@@ -12,6 +15,8 @@
+ //     bottom-left quadrant (yellow). Each pixel is read back and compared.
+ //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
+ //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
++//   - With the extension too, a DISPATCH_MESH command signature is created and a stride below its 12 bytes refused;
++//     ExecuteIndirect with it records nothing yet, so its list closes.
+ // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
+ // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+ #include "vk_test_device.h"
+@@ -168,7 +173,10 @@ int main() {
+     const D3D12_SHADER_BYTECODE ps{ps_container.data(), ps_container.size()};
+     const D3D12_SHADER_BYTECODE vs{vs_container.data(), vs_container.size()};
+ 
+-    // Without the extension: no tier, and a mesh PSO is refused as not implemented.
++    // Without the extension: no tier, and a mesh PSO is refused as not implemented. A DISPATCH_MESH command signature
++    // is created all the same: the host runtime creates one on an RX 5700 (MeshShaderTier 0, AMD driver
++    // 32.0.21045.29003) and on WARP (measured), and d3d12_vulkan_device_test compares the answer with the host's. A
++    // stride below its 12 bytes is refused, as there.
+     {
+         Ref<ID3D12Device> device;
+         Ref<ID3D12RootSignature> root;
+@@ -180,12 +188,65 @@ int main() {
+         stream.add(TargetsSubobject{.inner = one_target()});
+         Ref<ID3D12PipelineState> pso;
+         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
++        const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
++        const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
++        const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
++        Ref<ID3D12CommandSignature> sig, short_one;
++        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == S_OK && sig.p);
++        EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG &&
++               !short_one.p);
++
++        // ExecuteIndirect with it on one (1, 1, 1) record, in a direct list that is executed and waited on. Nothing
++        // is recorded for it (there is no mesh PSO to run it with), so the list does no GPU work of its own, and the
++        // device must come out of it usable.
++        const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
++        const auto args_desc = buffer_desc(256);
++        Ref<ID3D12Resource> args;
++        EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &args_desc,
++                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
++                                                         IID_PPV_ARGS(&args.p))));
++        void* mapped = nullptr;
++        EXPECT(SUCCEEDED(args->Map(0, nullptr, &mapped)) && mapped);
++        const D3D12_DISPATCH_MESH_ARGUMENTS one_group{1, 1, 1};
++        std::memcpy(mapped, &one_group, sizeof(one_group));
++        args->Unmap(0, nullptr);
++        const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
++        Ref<ID3D12CommandQueue> queue;
++        Ref<ID3D12CommandAllocator> allocator;
++        Ref<ID3D12GraphicsCommandList> list;
++        Ref<ID3D12Fence> fence;
++        EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
++        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
++        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
++                                                   IID_PPV_ARGS(&list.p))));
++        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
++        list->SetGraphicsRootSignature(root.p);
++        list->ExecuteIndirect(sig.p, 1, args.p, 0, nullptr, 0);
++        EXPECT(list->Close() == S_OK);
++        ID3D12CommandList* lists[] = {list.p};
++        queue->ExecuteCommandLists(1, lists);
++        EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
++        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
++        EXPECT(fence->GetCompletedValue() == 1);
++        EXPECT(device->GetDeviceRemovedReason() == S_OK);
++        list.reset();
++        allocator.reset();
++        queue.reset();
++        fence.reset();
++        args.reset();
++        sig.reset();
+         root.reset();
+         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+     }
++    // Counted here, so a GPU without the extension, which stops below, fails on an error in that run too.
++    if (d.validation_errors()) {
++        std::fprintf(stderr, "%u validation errors on the device without VK_EXT_mesh_shader\n", d.validation_errors());
++        return 1;
++    }
+     if (!d.mesh_shader) {
+         std::filesystem::remove_all(library);
+-        std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
++        std::printf("no VK_EXT_mesh_shader on this device: only the device without it was checked (mesh PSO refused; "
++                    "DISPATCH_MESH signature created, and a list with its ExecuteIndirect run and waited on)\n");
+         return 77;
+     }
+ 
+@@ -398,6 +459,21 @@ int main() {
+         list->RSSetViewports(1, &viewport);
+         list6->DispatchMesh(4096, 1025, 1);
+         EXPECT(list->Close() == E_INVALIDARG);
++        // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
++        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
++        // it), so the list still closes.
++        {
++            const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
++            const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
++            const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
++            Ref<ID3D12CommandSignature> sig, short_one;
++            EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
++            EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG);
++            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
++            list->SetGraphicsRootSignature(root.p);
++            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
++            EXPECT(list->Close() == S_OK);
++        }
+         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+ 
+         // D3D-291: pipeline statistics around mesh draws. Query 0 holds a vertex draw, two mesh draws and another
+diff --git a/runtime/test/d3d12_vulkan_device_test.cpp b/runtime/test/d3d12_vulkan_device_test.cpp
+index 0627330..2ad1a9d 100644
+--- a/runtime/test/d3d12_vulkan_device_test.cpp
++++ b/runtime/test/d3d12_vulkan_device_test.cpp
+@@ -4164,6 +4164,15 @@ int compare_invalid_arguments(ID3D12Device* ours) {
+         {"command signature: dispatch, stride 64", [](ID3D12Device* d) {
+              return command_signature(d, 64, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH});
+          }},
++        // DISPATCH_MESH whatever the GPU's MeshShaderTier (the layer device here has no mesh shaders). Measured on an
++        // RX 5700 host (MeshShaderTier 0, AMD driver 32.0.21045.29003, D3D12Core 10.0.26100.9818) and on WARP: both
++        // create it and refuse a stride below its 12 bytes.
++        {"command signature: dispatch mesh", [](ID3D12Device* d) {
++             return command_signature(d, 12, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH});
++         }},
++        {"command signature: dispatch mesh stride 8", [](ID3D12Device* d) {
++             return command_signature(d, 8, {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH});
++         }},
+         {"command signature: no arguments", [](ID3D12Device* d) { return command_signature(d, 16, {}); }},
+         {"command signature: stride 0", [](ID3D12Device* d) {
+              return command_signature(d, 0, {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW});
