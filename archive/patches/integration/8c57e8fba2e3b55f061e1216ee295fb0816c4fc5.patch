@@ -1,0 +1,516 @@
+diff --git a/runtime/shims/d3d12_com.cpp b/runtime/shims/d3d12_com.cpp
+index f25168a2a..005c37ed6 100644
+--- a/runtime/shims/d3d12_com.cpp
++++ b/runtime/shims/d3d12_com.cpp
+@@ -288,7 +288,7 @@ public:
+         set_pipeline(state);
+     }
+ 
+-    // Validates shader-visible descriptor heaps and tracks bound heap identities/bases (docs/d3d12_vulkan.md §3.2/§3.4).
++    // Validates shader-visible descriptor heaps and tracks bound heap identities/bases (docs/d3d12_vulkan.md Â§3.2/Â§3.4).
+     void STDMETHODCALLTYPE SetDescriptorHeaps(UINT num, ID3D12DescriptorHeap* const* heaps) override {
+         d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps");
+         if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
+@@ -487,7 +487,7 @@ public:
+         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_,
++        leonida::Draw draw{graphics_pipeline_, graphics_user_data(graphics_), draw_views(), depth_, {}, 0, viewport_,
+                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+         draw.mesh = true;
+         check(list_.draw(std::move(draw)));
+@@ -857,7 +857,7 @@ public:
+         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
+             if (!compute_pipeline_ || !compute_.layout) return check(false);
+             cmd.pipeline = compute_pipeline_;
+-            cmd.user_data = compute_.data;
++            cmd.user_data = compute_user_data();
+         }
+         check(list_.execute_indirect(cmd));
+     }
+@@ -1154,7 +1154,9 @@ private:
+ 
+     struct RootState {
+         const RootArgumentLayout* layout = nullptr;
+-        std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
++        // 64 dwords (D3D12's cost limit): a compute signature that overflows the user SGPRs keeps every parameter in
++        // the spilled block, laid out from dword 0 (RootArgumentLayout::compute_spilled).
++        std::array<std::uint32_t, rt::rootsig::kMaxD3d12Cost> data{};
+     };
+ 
+     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
+@@ -1196,12 +1198,13 @@ private:
+         return &state.layout->parameters[index];
+     }
+ 
+-    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
++    // Dwords beyond the 32 user registers are a compute signature's spilled block (RootArgumentLayout: they go to GPU
++    // memory at dispatch time); graphics has 32, which pack() never exceeds.
+     void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
+-        if (dword < rt::rootsig::kMaxUserSgprs)
++        if (dword < rt::rootsig::kMaxD3d12Cost)
+             state.data[dword] = value;
+         else
+-            stub("root arguments beyond 32 user-data dwords (spill not modelled)");
++            stub("root arguments beyond 64 dwords");
+     }
+ 
+     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+@@ -1388,7 +1391,33 @@ private:
+     void record_dispatch(UINT x, UINT y, UINT z) {
+         if (!compute_pipeline_ || !compute_.layout) return check(false);
+         note_direct_heap_indexing(compute_.layout);
+-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
++        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
++    }
++
++    // The 32 user-data dwords a compute dispatch carries (the translator copies them into s0..s31). An inline compute
++    // signature fills them from the root state. A spilled one passes the console VA of its argument block in s[0:1]
++    // and nothing else (rt::rootsig::pack_stage): the block is copied into GPU memory now, because the root state can
++    // change before the list runs.
++    std::array<std::uint32_t, 32> compute_user_data() {
++        std::array<std::uint32_t, 32> out{};
++        if (!compute_.layout) return out;
++        if (!compute_.layout->compute_spilled) {
++            std::copy(compute_.data.begin(), compute_.data.begin() + 32, out.begin());
++            return out;
++        }
++        const std::uint64_t va =
++            spill_compute_root_arguments(compute_pipeline_, compute_.data.data(), compute_.layout->compute_dwords);
++        if (!va) return out;
++        out[0] = std::uint32_t(va);
++        out[1] = std::uint32_t(va >> 32);  // the console's 40-bit pair: the shader masks s1 to 0xff
++        return out;
++    }
++
++    // A draw's dwords are the graphics layout's, which never exceed 32 (pack()).
++    static std::array<std::uint32_t, 32> graphics_user_data(const RootState& state) {
++        std::array<std::uint32_t, 32> out{};
++        std::copy(state.data.begin(), state.data.begin() + 32, out.begin());
++        return out;
+     }
+ 
+     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
+@@ -1411,7 +1440,7 @@ private:
+         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
+         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
+         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
++        leonida::Draw draw{graphics_pipeline_, graphics_user_data(graphics_), draw_views(), depth_, index_, topology_, viewport_,
+                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
+                            first, base_vertex, first_instance};
+         check(list_.draw(std::move(draw)));
+diff --git a/runtime/shims/d3d12_com.h b/runtime/shims/d3d12_com.h
+index 8f37b1ff2..bcdad7c93 100644
+--- a/runtime/shims/d3d12_com.h
++++ b/runtime/shims/d3d12_com.h
+@@ -368,13 +368,20 @@ struct RootArgumentLayout {
+     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
+     bool graphics_ok = true;
+     bool compute_ok = true;
++    // The compute signature overflows the user SGPRs, so nothing is inline: the whole block (compute_dwords dwords,
++    // each parameter at its `user_offset`) lives in GPU memory behind the 40-bit pointer at s[0:1] (see
++    // rt::rootsig::pack_stage).
++    bool compute_spilled = false;
++    std::uint32_t compute_dwords = 0;
+ };
+-
+ // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
+ // compute pipeline state (0: not a compute PSO of a Vulkan device).
+ const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
+ std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
+ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
++// Copies the spilled compute root-argument block (RootArgumentLayout::compute_dwords dwords at `data`) into GPU
++// memory and returns the console VA for s[0:1], or 0 when the pipeline is not a Vulkan compute PSO or there is no room.
++std::uint64_t spill_compute_root_arguments(std::uintptr_t pipeline, const std::uint32_t* data, std::uint32_t words);
+ // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
+ 
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index bbed09efb..146192ad3 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -798,6 +798,24 @@ struct DeviceState {
+         return shader_library.loaded() ? &shader_library : nullptr;
+     }
+ 
++    // LEONIDA_SHADER_LOG=1: one line per module a pipeline resolved and one per miss, so a boot harness can count what
++    // the boot path actually needs and translate on demand (`add_shader.py`). Off by default: the boot resolves
++    // hundreds of modules and every line goes to stderr.
++    static bool shader_log_enabled() {
++        static const bool enabled = [] {
++            char value[8] = {};
++            const DWORD length = GetEnvironmentVariableA("LEONIDA_SHADER_LOG", value, sizeof(value));
++            return length > 0 && value[0] != '\0' && value[0] != '0';
++        }();
++        return enabled;
++    }
++
++    static void log_shader_use(const char* stage, const leonida::ShaderEntry& entry) {
++        if (!shader_log_enabled()) return;
++        std::fprintf(stderr, "[rt] d3d12: shader used %s %s fssm=%s\n", stage, entry.name.c_str(),
++                     entry.fssm_sha256.c_str());
++    }
++
+     bool depth_usable(VkFormat format) const {
+         VkFormatProperties properties{};
+         format_properties(info.physical, format, &properties);
+@@ -3121,6 +3139,28 @@ public:
+     }
+ 
+     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
++
++    // A compute root signature that overflows the user SGPRs keeps its whole argument block in GPU memory behind the
++    // 40-bit pointer at s[0:1] (rt::rootsig::pack_stage). This copies the current block into the device's GPU address
++    // arena and returns the console VA to hand over; 0 when the arena has no room. The copy is never released: a
++    // block is 256 bytes and only a spilled signature allocates one, so a frame of dispatches costs a few hundred KiB.
++    std::uint64_t spill_root_arguments(const std::uint32_t* dwords, std::uint32_t count) {
++        if (!device_.arena.mapped || !count || count > rt::rootsig::kMaxD3d12Cost) return 0;
++        const VkDeviceSize bytes = (VkDeviceSize(count) * 4 + 255) & ~VkDeviceSize(255);
++        VkDeviceSize offset = 0;
++        if (!device_.arena_allocate(bytes, 256, offset, DeviceState::arena_heap)) {
++            log_once("spilled root arguments: the GPU address arena has no room for a block of dwords", int(count));
++            return 0;
++        }
++        std::memcpy(device_.arena.mapped + offset, dwords, VkDeviceSize(count) * 4);
++        const std::uint64_t va = device_.arena.address + offset;
++        // The console passes this in s[0:1] as a 40-bit address (the shader does s3 = s1 & 0xff). A Vulkan device
++        // address above 2^40 would be truncated there, so report it once instead of binding a wrong base.
++        if (va >> 40)
++            log_once("spilled root arguments sit above the console's 40-bit address space; the high bits are lost",
++                     int(va >> 40));
++        return va;
++    }
+     void set_cache_key(leonida::cached_pso::Key key) { cache_key_ = std::move(key); }
+ 
+     // A null pointer is accepted with S_OK, as by the PC runtime (measured on an RTX 3060 and WARP).
+@@ -3320,6 +3360,7 @@ public:
+                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                 return E_INVALIDARG;
+             }
++            DeviceState::log_shader_use(stage.name, *stage.entry);
+             if (stage.entry->binding_count) {
+                 if (!device_.bindless) {
+                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
+@@ -3795,6 +3836,7 @@ public:
+                              leonida::sha256_hex(program.bytes).c_str());
+             return E_INVALIDARG;
+         }
++        DeviceState::log_shader_use("cs", *entry);
+         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
+         // shader declares bindings has it in its layout and has it bound at every dispatch.
+         if (entry->binding_count && !device_.bindless) {
+@@ -5814,10 +5856,36 @@ public:
+             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
+         if (!compute.ok)
+             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
++        if (!compute.ok) {
++            // The spill rule is not modelled (root_signature.h). Dump the shape so the failing signature can be
++            // compared with the compute layout instead of guessed: index, type, dword span and visibility.
++            std::fprintf(stderr, "[rt] d3d12: root signature shape: %zu parameter(s), %u graphics dword(s), %u cost\n",
++                         parsed.sig.params.size(), packed.dword_count, packed.d3d12_cost);
++            for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
++                const auto& p = parsed.sig.params[i];
++                const char* type = p.type == rt::rootsig::ParamType::Constants ? "constants"
++                                  : p.type == rt::rootsig::ParamType::Descriptor ? "root-descriptor"
++                                                                                 : "table";
++                if (compute.first_sgpr.size() > i)
++                    std::fprintf(stderr,
++                                 "[rt] d3d12: root signature param %zu: %s, %u dword(s), visibility %u, %zu range(s), "
++                                 "compute s%u\n",
++                                 i, type, rt::rootsig::stage_dwords(p.type, p.num_values),
++                                 static_cast<unsigned>(p.visibility), p.ranges.size(), compute.first_sgpr[i]);
++                else
++                    std::fprintf(stderr,
++                                 "[rt] d3d12: root signature param %zu: %s, %u dword(s), visibility %u, %zu range(s), "
++                                 "compute spilled\n",
++                                 i, type, rt::rootsig::stage_dwords(p.type, p.num_values),
++                                 static_cast<unsigned>(p.visibility), p.ranges.size());
++            }
++        }
+         RootArgumentLayout layout;
+         layout.flags = parsed.sig.flags;
+         layout.graphics_ok = packed.ok;
+         layout.compute_ok = compute.ok;
++        layout.compute_spilled = compute.ok && compute.spilled;
++        layout.compute_dwords = compute.ok ? compute.end_sgpr : 0;
+         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+             std::uint32_t first = UINT32_MAX;
+             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
+@@ -8414,6 +8482,11 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
+     return p && p->graphics() ? p->id() : 0;
+ }
+ 
++std::uint64_t spill_compute_root_arguments(std::uintptr_t pipeline, const std::uint32_t* data, std::uint32_t dwords) {
++    PipelineState* p = PipelineState::from<PipelineState>(reinterpret_cast<ID3D12PipelineState*>(pipeline));
++    return p ? p->spill_root_arguments(data, dwords) : 0;
++}
++
+ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
+     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index fc01e2abb..f8c99a192 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -2153,6 +2153,85 @@ void write_null_srv(DeviceProxy* self, std::uint64_t destination) {
+     self->real->CreateShaderResourceView(nullptr, &null_view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+ }
+ 
++// Copies [va, va + bytes) into `dst`, region by region: the title's placeholder is many VirtualAlloc regions, so a
++// single VirtualQuery does not cover it. A page that is not committed and readable stays zero. Returns the bytes copied.
++std::uint64_t copy_console_va(void* dst, std::uint64_t va, std::uint64_t bytes) {
++    auto* out = static_cast<std::uint8_t*>(dst);
++    std::uint64_t copied = 0;
++    for (std::uint64_t at = 0; at < bytes;) {
++        MEMORY_BASIC_INFORMATION info{};
++        const auto* address = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va + at));
++        if (VirtualQuery(address, &info, sizeof(info)) == 0) break;
++        const std::uint64_t base = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
++        const std::uint64_t end = base + info.RegionSize;
++        const std::uint64_t here = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address));
++        const std::uint64_t take = std::min<std::uint64_t>(end - here, bytes - at);
++        if (!take) break;
++        const bool usable = info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
++        if (usable) {
++            std::memcpy(out + at, address, static_cast<std::size_t>(take));
++            copied += take;
++        }
++        at += take;
++    }
++    return copied;
++}
++
++// One log line for the first few console-VA copies (see acquire_console_va_buffer).
++void log_console_va_once(const char* why, int value) {
++    static std::atomic<unsigned> logged{0};
++    if (logged.fetch_add(1) < 4) std::fprintf(stderr, "[rt] d3d12_xs: slot 70: %s %d\n", why, value);
++}
++
++// The cheap half of "alias the console VA": the title's bytes at a console VA it mapped itself (XMemVirtualAlloc +
++// XMemMapPhysicalPages) are not the layer's buffer, so copy them into an UPLOAD-heap buffer of the same width and make
++// the raw view over that. Measured need: the first retail slot-70 call names VA 0x1f6f8400220, which no buffer of the
++// layer holds (slot 133's one placed resource is at 0x1f6f8f00000). The copy happens when the view is made, so a write
++// the title does after this call is not seen: import (VK_KHR_external_memory_win32) is the real fix, this is the proof
++// that the bytes reach the GPU at all. One buffer per call, never released (a boot-level diagnostic).
++ID3D12Resource* acquire_console_va_buffer(DeviceProxy* self, std::uint64_t va, std::uint64_t bytes) {
++    // The measured first call's width is 174 MiB (the title's 0xAE00000-byte buffers), so the cap has to sit above
++    // that; it only bounds a copy that would be absurd for this diagnostic path.
++    constexpr std::uint64_t kMaxBytes = 512ull << 20;
++    if (!bytes || bytes > kMaxBytes) {
++        log_console_va_once("the description's width is 0 or over 512 MiB; bytes", int(bytes));
++        return nullptr;
++    }
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    desc.Alignment = 0;
++    desc.Width = bytes;
++    desc.Height = 1;
++    desc.DepthOrArraySize = 1;
++    desc.MipLevels = 1;
++    desc.Format = DXGI_FORMAT_UNKNOWN;
++    desc.SampleDesc = {1, 0};
++    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
++    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
++                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
++    ID3D12Resource* resource = nullptr;
++    const HRESULT hr = self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++                                                           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
++                                                           __uuidof(ID3D12Resource), reinterpret_cast<void**>(&resource));
++    if (FAILED(hr) || !resource) return nullptr;
++    void* mapped = nullptr;
++    if (FAILED(resource->Map(0, nullptr, &mapped)) || !mapped) {
++        resource->Release();
++        return nullptr;
++    }
++    const std::uint64_t copied = copy_console_va(mapped, va, bytes);
++    resource->Unmap(0, nullptr);
++    static std::atomic<unsigned> logged{0};
++    if (logged.fetch_add(1) < 4)
++        std::fprintf(stderr,
++                     "[rt] d3d12_xs: slot 70 copied %llu of %llu bytes from the console VA 0x%llx into an upload "
++                     "buffer: the view now names the title's bytes\n",
++                     static_cast<unsigned long long>(copied), static_cast<unsigned long long>(bytes),
++                     static_cast<unsigned long long>(va));
++    return resource;
++}
++
+ void log_slot70_null_once(const char* why, std::uint64_t texture_words, std::uint64_t view_desc) {
+     static std::atomic<bool> logged{false};
+     if (first_call(logged))
+@@ -2177,13 +2256,22 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
+     }
+     std::uint64_t start = 0, size = 0;
+     ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
+-    if (!resource || shape.va < start || shape.va - start >= size) {
++    std::uint64_t offset = 0;
++    if (resource && shape.va >= start && shape.va - start < size) {
++        offset = shape.va - start;
++    } else {
+         if (resource) resource->Release();
+-        log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
+-        write_null_srv(self, destination);
+-        return;
++        // No buffer of the layer holds this console VA: it is one of the title's own XMem ranges, so copy the bytes
++        // across and view the copy (acquire_console_va_buffer). A texture or an unreadable range keeps the null view.
++        resource = acquire_console_va_buffer(self, shape.va, shape.resource.Width);
++        if (!resource) {
++            log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
++            write_null_srv(self, destination);
++            return;
++        }
++        start = shape.va;
++        size = shape.resource.Width;
+     }
+-    const std::uint64_t offset = shape.va - start;
+     const std::uint64_t elements = std::min<std::uint64_t>(shape.resource.Width, size - offset) / 4;
+     if (offset % 4 || !elements || elements > UINT32_MAX) {
+         resource->Release();
+diff --git a/runtime/src/root_signature.cpp b/runtime/src/root_signature.cpp
+index a0eb96cce..eeb7a9f1f 100644
+--- a/runtime/src/root_signature.cpp
++++ b/runtime/src/root_signature.cpp
+@@ -1,6 +1,7 @@
+ // Portable root-signature packer, see root_signature.h.
+ #include "root_signature.h"
+ 
++#include <algorithm>
+ #include <cstring>
+ 
+ namespace rt::rootsig {
+@@ -61,6 +62,7 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
+     uint64_t next = out.base;
+     std::vector<uint32_t> first;
+     first.reserve(sig.params.size());
++    bool spilled = false;
+     for (size_t i = 0; i < sig.params.size(); ++i) {
+         const RootParameter& p = sig.params[i];
+         if (p.type == ParamType::Constants && p.num_values == 0) {
+@@ -73,18 +75,22 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
+             return out;
+         }
+         const uint64_t dwords = stage_dwords(p.type, p.num_values);
+-        if (next + dwords > kMaxUserSgprs) {
+-            // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's
+-            // layout is not modelled here, so refuse rather than drop arguments.
+-            out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
+-                        std::to_string(out.base) + " (spill array not modelled)";
+-            return out;
++        if (!spilled && next + dwords > kMaxUserSgprs) {
++            // Everything spills: the console passes no parameter inline and puts the whole block behind s[0:1].
++            spilled = true;
++            next = 0;
++            std::fill(first.begin(), first.end(), 0);  // re-laid below, from block dword 0
++            for (size_t j = 0; j < i; ++j) {
++                first[j] = static_cast<uint32_t>(next);
++                next += stage_dwords(sig.params[j].type, sig.params[j].num_values);
++            }
+         }
+         first.push_back(static_cast<uint32_t>(next));
+         next += dwords;
+     }
+     out.first_sgpr = std::move(first);
+     out.end_sgpr = static_cast<uint32_t>(next);
++    out.spilled = spilled;
+     out.d3d12_cost = static_cast<uint32_t>(cost);
+     out.ok = true;
+     return out;
+diff --git a/runtime/src/root_signature.h b/runtime/src/root_signature.h
+index 376962940..fa12ce324 100644
+--- a/runtime/src/root_signature.h
++++ b/runtime/src/root_signature.h
+@@ -131,8 +131,9 @@ constexpr uint32_t kMaxD3d12Cost = 64;
+ //     pointer s4, one-dword tables).
+ //   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
+ //     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
+-// A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
+-// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
++// A parameter that does not fit goes to the console's spill array behind s[0:1] together with every parameter after it
++// and, as measured, with every parameter before it too: the block holds the whole root argument block and no parameter
++// is inline. pack_stage() models that block.
+ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
+ 
+ [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
+@@ -169,13 +170,21 @@ struct StagePackResult {
+     std::string error;            // set when !ok; names the refusing parameter
+     Stage stage = Stage::Compute;
+     uint32_t base = 0;            // stage_base(stage)
+-    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
++    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR, or (spilled) its block dword index
+     uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
+     uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
++    bool spilled = false;         // the block lives in memory behind s[0:1]; nothing is inline
+ };
+ 
+ // Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
+-// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
++// constant parameter of 0 values or the 64-dword cost limit.
++//
++// A signature whose span does not fit the user SGPRs above the stage base spills: the console puts the WHOLE block in
++// memory behind a 40-bit pointer in `s[0:1]` and passes no parameter inline (measured: XboxBvhBuilder's compute
++// programs, `LoadTriangles`). The result then has `spilled` set, `first_sgpr` holding each parameter's dword index in
++// that block (from 0), and `end_sgpr` the block's size in dwords. The block's layout is the inline layout, dword for
++// dword: a constant takes one dword per value, a root CBV/SRV/UAV two (its 64-bit VA), a descriptor table one (the
++// 32-bit VA of its first descriptor).
+ [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
+ 
+ // D3D12 cost of one parameter against the 64-dword limit.
+diff --git a/runtime/test/root_signature_test.cpp b/runtime/test/root_signature_test.cpp
+index 831739a8c..b6916fba0 100644
+--- a/runtime/test/root_signature_test.cpp
++++ b/runtime/test/root_signature_test.cpp
+@@ -424,29 +424,33 @@ int main() {
+         check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
+     }
+ 
+-    // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
++    // A signature that overflows the stage's SGPRs spills whole: compute has 28 SGPRs above s4, mesh 16 above s16,
++    // and the block behind s[0:1] holds every parameter, laid out from dword 0 (measured: XboxBvhBuilder's
++    // LoadTriangles, 8 root descriptors then 14 constants, reads at +0x00, +0x20 and +0x40 of s[0:1]).
+     {
+         RootSignature exact;
+         exact.params = {consts(28)};
+-        check(pack_stage(exact, Stage::Compute).ok, "pack_stage: 28 constants fill compute exactly");
++        check(pack_stage(exact, Stage::Compute).ok && !pack_stage(exact, Stage::Compute).spilled,
++              "pack_stage: 28 constants fill compute exactly");
+         RootSignature over;
+         over.params = {consts(27), view()};  // the view would need s31..s32
+         const StagePackResult r = pack_stage(over, Stage::Compute);
+-        check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
+-                  r.error.find("spill") != std::string::npos,
+-              "pack_stage: a parameter that does not fit whole is refused and named");
++        check(r.ok && r.spilled && r.first_sgpr == std::vector<uint32_t>({0, 27}) && r.end_sgpr == 29,
++              "pack_stage: an overflowing signature spills whole, laid out from dword 0");
+         RootSignature fits_old;
+         fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
+-        check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
+-              "pack_stage: compute budget is 28, not 32");
++        check(pack(fits_old).ok && pack_stage(fits_old, Stage::Compute).spilled,
++              "pack_stage: compute budget is 28; 30 constants spill although pack() places them");
+         RootSignature tables;
+         tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
+-        check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
++        check(pack_stage(tables, Stage::Compute).ok && !pack_stage(tables, Stage::Compute).spilled && !pack(tables).ok,
+               "pack_stage: 20 one-dword tables fit compute, which pack() refuses (40 dwords of tables)");
+         tables.params.assign(16, table());  // fills mesh s16..s31 exactly
+-        check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
++        check(pack_stage(tables, Stage::Mesh).ok && !pack_stage(tables, Stage::Mesh).spilled,
++              "pack_stage: 16 tables fill the mesh stage exactly");
+         tables.params.push_back(table());
+-        check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
++        const StagePackResult mesh_spill = pack_stage(tables, Stage::Mesh);
++        check(mesh_spill.ok && mesh_spill.spilled && mesh_spill.end_sgpr == 17, "pack_stage: a 17th table spills on mesh");
+     }
+ 
+     // pack_stage keeps pack()'s validation.
+@@ -454,8 +458,6 @@ int main() {
+         RootSignature zero;
+         zero.params = {consts(0)};
+         check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
+-        // Every parameter takes at least as many SGPRs as it costs, so the 32-SGPR budget refuses before the
+-        // 64-dword cost limit can; an over-cost signature is refused all the same.
+         RootSignature costly;
+         costly.params = {consts(40), consts(30)};
+         check(!pack_stage(costly, Stage::Compute).ok, "pack_stage: over-cost signature refused");
