@@ -1,0 +1,260 @@
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index e17a80353..832347854 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -5,10 +5,11 @@
+ // the same index through a 15-argument integer prototype. Every PC D3D12 device method takes integer/pointer
+ // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
+ // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
+-// are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
+-// PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap
+-// what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50 hand the real objects
+-// behind heap, queue and fence proxies to the real device (see the command queue and fence section).
++// are IUnknown (0-2), slot 14 (which wraps the heap), 26 (the title passes the return buffer in RCX and the device in
++// RDX), 62 and 76, plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
++// 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
++// the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
++// device (see the command queue and fence section).
+ //
+ // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
+ // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
+@@ -128,6 +129,7 @@ const char* slot_name(unsigned slot) {
+         case 14: return "CreateDescriptorHeap";
+         case 16: return "CreateRootSignature";
+         case 25: return "GetResourceAllocationInfo";
++        case 26: return "GetCustomHeapProperties";
+         case 27: return "CreateCommittedResource (PC slot 27)";
+         case 31: return "CreateSharedHandle (proxies unwrapped)";
+         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
+@@ -1480,6 +1482,21 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
+                                                *riid, out);
+ }
+ 
++// Device slot 26, GetCustomHeapProperties, as the retail executable calls it. Measured on 1.0.2.1 under
++// gta6rt --run with a register probe in this slot's thunk: three calls right after device creation, each with the
++// device proxy in RDX and not in RCX, R8 = 1 and R9 = 1, 2, 3 (node mask 1; DEFAULT, UPLOAD, READBACK). So the
++// buffer for the returned D3D12_HEAP_PROPERTIES is in RCX and the device in RDX. That is how x64 passes them to a
++// plain function that takes the device as its first argument and returns a struct; a PC C++ method has the device
++// in RCX and the buffer in RDX. The forwarder took RCX for the proxy, read the PC vtable out of the title's stack
++// buffer and faulted. The buffer's address goes back in RAX, as that convention returns it; what the title does with
++// RAX is not measured.
++D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* out, DeviceProxy* self,
++                                                        UINT node_mask, D3D12_HEAP_TYPE heap_type) {
++    note_slot(26);
++    *out = self->real->GetCustomHeapProperties(node_mask, heap_type);
++    return out;
++}
++
+ template <unsigned Slot>
+ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+@@ -1530,6 +1547,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
+             reinterpret_cast<void**>(a7)));
+     } else {
++        if constexpr (Slot == 26) {
++            // The console form has the device in RDX. A PC C++ caller has the proxy in RCX and its return buffer in
++            // RDX; that call goes to the forwarder below, as before.
++            if (is_device_proxy(reinterpret_cast<const void*>(a1)))
++                return reinterpret_cast<std::uint64_t>(proxy_get_custom_heap_properties(
++                    reinterpret_cast<D3D12_HEAP_PROPERTIES*>(self), reinterpret_cast<DeviceProxy*>(a1),
++                    static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
++        }
+         note_slot(Slot);
+         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
+         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
+@@ -1704,8 +1729,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ }
+ 
+ bool device_slot_overridden(unsigned slot) {
+-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
++    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
++        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+         slot == 75 || slot == 76)
+         return true;
+     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 0019ec506..0f187708c 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -1,6 +1,12 @@
+ // Xbox-ABI proxy around a PC ID3D12Device.
+ //
+ // Measured Xbox device deviations used here (vtable indices, x64):
++//   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
++//             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9). A PC C++ method has
++//             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
++//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too and are still
++//             forwarded in the PC form: 25 is reported called the same way later in the boot (#6982), with console
++//             resource descriptions the PC method cannot take as they are, and no call of 43 has been seen.
+ //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
+ //             before the IID. The PC slot 62 is CreateStateObject.
+ //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
+@@ -90,10 +96,10 @@ unsigned device_proxy_slot_count(const void* device);
+ ID3D12Device* device_proxy_real_device(const void* device);
+ 
+ // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
+-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
+-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
+-// measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
+-// handles for the allocator proxy.
++// proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
++// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76.
++// Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
++// CreateCommandAllocator, which the proxy handles for the allocator proxy.
+ bool device_slot_overridden(unsigned slot);
+ 
+ // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
+diff --git a/runtime/test/device_proxy_test.cpp b/runtime/test/device_proxy_test.cpp
+index 46a853e7c..94bf428d2 100644
+--- a/runtime/test/device_proxy_test.cpp
++++ b/runtime/test/device_proxy_test.cpp
+@@ -3,6 +3,7 @@
+ // It creates the proxy through the registered d3d12_xs!D3D12XboxCreateDevice shim, then calls the measured Xbox
+ // slots exactly as the guest would (raw function pointers, not the C++ interface):
+ //   slot 14  CreateDescriptorHeap (returns a heap proxy)
++//   slot 26  GetCustomHeapProperties with the struct's buffer in RCX and the device in RDX
+ //   heap 9/10 GetCPU/GetGPUDescriptorHandleForHeapStart (Xbox: 8-byte handle in RAX; the PC heap uses the
+ //             hidden return pointer in RDX, so slot 14 wraps it)
+ //   slot 62  CreateComputePipelineState
+@@ -206,6 +207,41 @@ int main(int argc, char** argv) {
+                                         IID_PPV_ARGS(reserved.GetAddressOf()));
+     check(SUCCEEDED(hr) && reserved != nullptr, "slot 30 forwards CreateReservedResource (stack arguments)");
+ 
++    // Slot 26 the way the retail executable calls GetCustomHeapProperties: the buffer for the struct in RCX, the
++    // device in RDX, for the three heap types it asks about. The answer is the PC device's own, and nothing but
++    // the struct is written (the buffer sits in a pattern). On main this call read the PC vtable through the buffer.
++    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 takes the console's struct-return form");
++    using XboxGetCustomHeapPropertiesFn =
++        D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
++    auto get_custom_heap = reinterpret_cast<XboxGetCustomHeapPropertiesFn>(proxy_vtbl[26]);
++    const D3D12_HEAP_TYPE heap_types[] = {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK};
++    bool console_returns_buffer = true, console_matches_pc = real != nullptr, console_writes_only_struct = true;
++    for (const D3D12_HEAP_TYPE type : heap_types) {
++        struct Padded {
++            D3D12_HEAP_PROPERTIES value;
++            std::uint8_t after[64];
++        } padded;
++        std::memset(&padded, 0xA5, sizeof(padded));
++        console_returns_buffer = get_custom_heap(&padded.value, device.Get(), 1, type) == &padded.value &&
++                                 console_returns_buffer;
++        const D3D12_HEAP_PROPERTIES want = real ? real->GetCustomHeapProperties(1, type) : D3D12_HEAP_PROPERTIES{};
++        console_matches_pc = console_matches_pc && std::memcmp(&padded.value, &want, sizeof(want)) == 0;
++        for (const std::uint8_t byte : padded.after)
++            console_writes_only_struct = console_writes_only_struct && byte == 0xA5;
++    }
++    check(console_returns_buffer, "slot 26 console form returns the buffer's address");
++    check(console_matches_pc, "slot 26 console form writes the PC device's DEFAULT, UPLOAD and READBACK properties");
++    check(console_writes_only_struct, "slot 26 console form writes nothing past the struct");
++    check(rt::d3d12_xs::device_slot_hits(26) == 3, "slot 26 hit counter is 3");
++    check(rt::d3d12_xs::is_device_proxy(device.Get()) && rt::d3d12_xs::device_proxy_real_device(device.Get()) == real,
++          "the proxy is intact after the console-form calls");
++    // A PC C++ call through the proxy (the proxy in RCX, the buffer in RDX) is still forwarded.
++    const D3D12_HEAP_PROPERTIES pc_form = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
++    const D3D12_HEAP_PROPERTIES pc_want = real ? real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD)
++                                               : D3D12_HEAP_PROPERTIES{};
++    check(real && std::memcmp(&pc_form, &pc_want, sizeof(pc_want)) == 0 && rt::d3d12_xs::device_slot_hits(26) == 4,
++          "slot 26 PC form still forwards GetCustomHeapProperties");
++
+     // Slot 14: descriptor heap through the proxy. The proxy wraps the real PC heap for the handle ABI.
+     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index f0030116b..a4c9ed9e7 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -7,6 +7,7 @@
+ //   - OpenSharedHandle of a fence (as ID3D12Fence, IUnknown, Fence1), of a non-fence object, of an invalid handle,
+ //     and with a null output or IID, with the references of every object it touches;
+ //   - allocation failures in the proxy (operator new, the arrays it unwraps), injected in this executable only;
++//   - device slot 26 called the console's way (the struct's buffer in RCX, the device in RDX) and the PC way;
+ //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
+ //     patching this executable's own import table before the first proxy table is built (one process each).
+ // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
+@@ -75,6 +76,7 @@ enum class Kind { device, queue, fence, resource, allocator, command_list };
+ constexpr unsigned kMockSlots = 128;
+ constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
+ constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
++constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
+ // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
+ constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
+ 
+@@ -196,6 +198,15 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
+                 return static_cast<std::uint32_t>(E_INVALIDARG);
+             case 34: case 35: case 46: copy_array(m, slot, a2, a1); break;  // (count, objects, ...)
+             case 45: copy_array(m, slot, a1, a3); break;                    // (fences, values, count, ...)
++            case 26: {  // GetCustomHeapProperties, the PC method: (return buffer, node mask, heap type)
++                auto* out = reinterpret_cast<D3D12_HEAP_PROPERTIES*>(a1);
++                if (!out) break;
++                *out = {};
++                out->Type = static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3));
++                out->CreationNodeMask = static_cast<UINT>(a2);
++                out->VisibleNodeMask = kHeapMarker;
++                return a1;  // a struct-returning method hands the buffer's address back in RAX
++            }
+             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
+             default: break;
+         }
+@@ -821,7 +832,51 @@ int run_env_slots(bool valid) {
+     return 0;
+ }
+ 
+-// ---- 9. The refused tail and the guard region ----
++// ---- 9. Device slot 26, GetCustomHeapProperties, the console's way and the PC's ----
++
++int check_custom_heap_properties() {
++    Mock* mock = nullptr;
++    void* device = make_device(mock, 0, true);
++    EXPECT(device && xs::device_slot_overridden(26));
++    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
++
++    // The retail executable's call: the buffer for the struct in RCX, the device in RDX, node mask and heap type in
++    // R8 and R9 (their upper halves are not the callee's to read). The buffer sits inside a pattern that must stay.
++    struct Padded {
++        std::uint8_t before[16];
++        D3D12_HEAP_PROPERTIES value;
++        std::uint8_t after[64];
++    } padded;
++    std::memset(&padded, 0xA5, sizeof(padded));
++    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t);
++    const std::uint64_t returned = reinterpret_cast<ConsoleFn>(vtable[26])(
++        &padded.value, device, 0xdeadbeef00000001ull, 0xdeadbeef00000002ull);
++    EXPECT(returned == word(&padded.value));
++    // The PC method got (buffer, node mask, heap type) once, on the device behind the proxy.
++    EXPECT(mock->calls[26] == 1);
++    EXPECT(static_cast<std::uint32_t>(mock->args[26][1]) == 1 && static_cast<std::uint32_t>(mock->args[26][2]) == 2);
++    EXPECT(padded.value.Type == D3D12_HEAP_TYPE_UPLOAD && padded.value.CreationNodeMask == 1 &&
++           padded.value.VisibleNodeMask == kHeapMarker);
++    for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
++    for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
++    // The proxy is what it was: main's forwarder took the buffer for the proxy, and a thunk that took the proxy
++    // for the buffer would write the struct over it.
++    EXPECT(xs::is_device_proxy(device) && word(xs::device_proxy_real_device(device)) == word(mock) &&
++           xs::device_proxy_slot_count(device) == 44 && xs::device_proxy_ref_count(device) == 1);
++
++    // A PC C++ caller: the proxy in RCX and its buffer in RDX. That call is forwarded as it is.
++    D3D12_HEAP_PROPERTIES pc{};
++    EXPECT(raw(device, 26, word(&pc), 1, 3) == word(&pc));
++    EXPECT(mock->calls[26] == 2 && mock->args[26][0] == word(&pc));
++    EXPECT(pc.Type == D3D12_HEAP_TYPE_READBACK && pc.CreationNodeMask == 1 && pc.VisibleNodeMask == kHeapMarker);
++
++    EXPECT(release(device) == 0 && mock->refs == 0);
++    std::printf("%s: device slot 26 with the buffer in RCX and the device in RDX reaches the PC method and writes "
++                "only the struct; the PC form is forwarded unchanged\n", g_label);
++    return 0;
++}
++
++// ---- 10. The refused tail and the guard region ----
+ 
+ int check_tail(bool want_guarded) {
+     Mock* mock = nullptr;
+@@ -948,7 +1003,7 @@ int main(int argc, char** argv) {
+     }
+     if (argc != 1) return 2;
+     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+-        check_alloc_failures() || check_allocators() || check_xbox_slots())
++        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties())
+         return 1;
+     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
+     return 0;
