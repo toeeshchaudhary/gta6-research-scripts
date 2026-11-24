@@ -28,4 +28,18 @@ The furthest documented run stopped while preparing the first 3840 × 2160 back 
 
 ## Archive coverage
 
-The repository preserves selected Python research scripts and renderer source. The source snapshots were filtered before publication. This report summarizes the local REPORT, ENGINE_M2, ENGINE_M4, MISSIONRT, SPIRV_RUN, CITY and BOOT6 records. Raw inputs, screenshots, per-run traces, intermediate data, binaries and the complete original Git histories are outside this archive. A fresh checkout alone cannot recreate the historical measurements.
+The repository preserves selected Python research scripts and renderer source. The source snapshots were filtered before publication. This report summarizes the local REPORT, ENGINE_M2, ENGINE_M4, MISSIONRT, SPIRV_RUN, CITY and BOOT6 records. Raw inputs, other screenshots, per-run traces, intermediate data, binaries and the complete original Git histories are outside this archive. A fresh checkout alone cannot recreate the historical measurements.
+
+## Original renderer captures
+
+![Reconstructed street in the standalone Vulkan renderer](screenshots/m4_street.png)
+
+**Street assembly.** Decoded geometry drawn at consistent scale in an authored test layout.
+
+![Handguard mesh in the translated shader test](screenshots/shot_m2_mesh.png)
+
+**Mesh test.** A 17,168-triangle handguard drawn through translated vertex and pixel stages.
+
+![Full-screen pixel shader sampling test](screenshots/shot_game_shader.png)
+
+**Pixel test.** A known input sampled through a translated shader. The recorded luminance correlation was 0.9982.
