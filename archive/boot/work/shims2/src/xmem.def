@@ -1,0 +1,17 @@
+LIBRARY xmem
+EXPORTS
+    XMemAlloc
+    XMemAllocDefault
+    XMemAllocatePhysicalPages
+    XMemFree
+    XMemFreeDefault
+    XMemFreePhysicalPages
+    XMemGetBaseAddress
+    XMemGetSize
+    XMemGetWorkingSetStatistics
+    XMemIsToolsMemAvailable
+    XMemMapPhysicalPages
+    XMemMapPhysicalPagesScatter
+    XMemTransferMemory
+    XMemVirtualAlloc
+    XMemVirtualQuery
