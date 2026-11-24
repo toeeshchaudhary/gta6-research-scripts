@@ -1,0 +1,200 @@
+diff --git a/docs/design.md b/docs/design.md
+index 703c870c69..fc9c324a0b 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -182,7 +182,9 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the
+   `CreateCommittedResource` with the Xbox `0x101`/`0x1` layout word replaced by the PC layout. Slots 9/10 are
+   `ID3D12DescriptorHeap` methods, not device methods. The PC heap getters take a hidden return pointer (RDX),
+   while Xbox expects the 8-byte handle in RAX, so slot 14 wraps the heap and slots 9/10 convert it. The heap holds
+-  a reference to the device proxy and its `GetDevice` returns that same proxy. Queues, fences, command lists and
++  a reference to the device proxy and its `GetDevice` returns that same proxy. The retail executable calls the
++  struct-returning device methods with the C ABI, return buffer first: `GetCustomHeapProperties` (slot 26) is
++  measured as `rcx` = buffer, `rdx` = device. Slots 25 and 26 take that form, and still take the PC one. Queues, fences, command lists and
+   `PresentX` extensions remain unimplemented.
+ - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
+   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 590f86bd73..72fa1b3bc4 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -3,12 +3,13 @@
+ // How forwarding works: the proxy object's first word is a vtable built once from one thunk per slot. A thunk
+ // receives the proxy in RCX, replaces it with the PC device pointer from offset 8, and tail-calls the PC method at
+ // the same index through a 15-argument integer prototype. Every PC D3D12 device method takes integer/pointer
+-// arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
+-// hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
+-// are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
+-// PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap
+-// what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50 hand the real objects
+-// behind heap, queue and fence proxies to the real device (see the command queue and fence section).
++// arguments only, so the x64 registers and stack words line up exactly. The measured exceptions are IUnknown (0-2),
++// slot 14 (which wraps the heap), 62 and 76, the struct-returning slots 25 and 26 (the title calls them with the C
++// ABI, hidden return pointer first: see "Struct-returning device methods" below), plus the heap proxy's 9/10
++// conversion from the PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32
++// (a shared fence) wrap what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50
++// hand the real objects behind heap, queue and fence proxies to the real device (see the command queue and fence
++// section).
+ //
+ // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
+ // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
+@@ -111,7 +112,8 @@ const char* slot_name(unsigned slot) {
+         case 11: return "CreateComputePipelineState (PC slot 11)";
+         case 14: return "CreateDescriptorHeap";
+         case 16: return "CreateRootSignature";
+-        case 25: return "GetResourceAllocationInfo";
++        case 25: return "GetResourceAllocationInfo (C or PC form)";
++        case 26: return "GetCustomHeapProperties (C or PC form)";
+         case 27: return "CreateCommittedResource (PC slot 27)";
+         case 31: return "CreateSharedHandle (proxies unwrapped)";
+         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
+@@ -1387,10 +1389,64 @@ void fill_vtable(void** vtable, std::index_sequence<I...>) {
+     ((vtable[I] = reinterpret_cast<void*>(&proxy_slot<static_cast<unsigned>(I)>) ), ...);
+ }
+ 
++// ---- Struct-returning device methods: the console title calls them with the C ABI ----
++//
++// The PC vtable (MSVC C++) takes `this` in RCX and, for a struct return, the hidden return pointer in RDX. The console
++// title does not. Measured with the retail game_scarlett_master.exe 1.0.2.1 under gta6rt --run: its first
++// GetCustomHeapProperties call (device slot 26) is `rcx = return buffer on the caller's stack, rdx = the device,
++// r8 = node mask 1, r9 = heap type` (DEFAULT, then UPLOAD), and it reads the result from that buffer. That is the C
++// convention, where a struct wider than 8 bytes comes back through a hidden *first* argument (an 8-byte one comes back
++// in RAX, which is what the heap proxy's slots 9/10 already measured). The generic forwarder took the return buffer
++// for the device and crashed on its vtable.
++//
++// The runtime's own code and tests still call the proxy through d3d12.h, in the PC form, so these thunks accept both,
++// as the heap proxy's 9/10 do: whichever of the first two arguments is the device proxy (its first word is the proxy
++// vtable) is `this`, and the other is the return buffer. A return buffer never starts with that vtable pointer: the
++// C-form caller hands over uninitialised memory to be written, and the PC-form caller is this runtime. The buffer is
++// returned in RAX, as both conventions require.
++//   slot 25 GetResourceAllocationInfo -> D3D12_RESOURCE_ALLOCATION_INFO (16 bytes): same rule as slot 26 (inferred,
++//           no call site measured yet)
++//   slot 26 GetCustomHeapProperties   -> D3D12_HEAP_PROPERTIES (20 bytes): measured
++// Not changed: slot 43 GetAdapterLuid (an 8-byte LUID; by the same rule the title would expect it in RAX, but no call
++// site is measured yet, so it still forwards in the PC form).
++void** get_vtable();
++
++struct StructReturnCall {
++    DeviceProxy* self;
++    void* ret;
++};
++
++StructReturnCall struct_return_call(std::uint64_t a0, std::uint64_t a1) {
++    void** const vtable = get_vtable();
++    if (a0 && *reinterpret_cast<void***>(a0) == vtable)  // PC form: this, return buffer
++        return {reinterpret_cast<DeviceProxy*>(a0), reinterpret_cast<void*>(a1)};
++    return {reinterpret_cast<DeviceProxy*>(a1), reinterpret_cast<void*>(a0)};  // C form: return buffer, this
++}
++
++void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t a1, std::uint64_t visible_mask,
++                                                std::uint64_t count, const D3D12_RESOURCE_DESC* descs) {
++    note_slot(25);
++    const StructReturnCall call = struct_return_call(a0, a1);
++    *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = call.self->real->GetResourceAllocationInfo(
++        static_cast<UINT>(visible_mask), static_cast<UINT>(count), descs);
++    return call.ret;
++}
++
++void* WINAPI proxy_get_custom_heap_properties(std::uint64_t a0, std::uint64_t a1, std::uint64_t node_mask,
++                                              std::uint64_t heap_type) {
++    note_slot(26);
++    const StructReturnCall call = struct_return_call(a0, a1);
++    *static_cast<D3D12_HEAP_PROPERTIES*>(call.ret) = call.self->real->GetCustomHeapProperties(
++        static_cast<UINT>(node_mask), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(heap_type)));
++    return call.ret;
++}
++
+ void** get_vtable() {
+     static void** vtable = [] {
+         static void* storage[kMaxSlots];
+         fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
++        storage[25] = reinterpret_cast<void*>(&proxy_get_resource_allocation_info);
++        storage[26] = reinterpret_cast<void*>(&proxy_get_custom_heap_properties);
+         return storage;
+     }();
+     return vtable;
+@@ -1515,9 +1571,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ }
+ 
+ bool device_slot_overridden(unsigned slot) {
+-    return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
+-           slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+-           slot == 75 || slot == 76;
++    return slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 25 || slot == 26 || slot == 31 || slot == 32 ||
++           slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 ||
++           slot == 67 || slot == 75 || slot == 76;
+ }
+ 
+ bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 8ff508e6fd..95ba2ef98a 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -7,6 +7,9 @@
+ //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
+ //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
+ //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
++//   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
++//             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
++//             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
+ // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
+ // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
+ // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
+diff --git a/runtime/test/device_proxy_test.cpp b/runtime/test/device_proxy_test.cpp
+index d5a6ec04e1..f30207336c 100644
+--- a/runtime/test/device_proxy_test.cpp
++++ b/runtime/test/device_proxy_test.cpp
+@@ -3,6 +3,7 @@
+ // It creates the proxy through the registered d3d12_xs!D3D12XboxCreateDevice shim, then calls the measured Xbox
+ // slots exactly as the guest would (raw function pointers, not the C++ interface):
+ //   slot 14  CreateDescriptorHeap (returns a heap proxy)
++//   slot 25/26 GetResourceAllocationInfo/GetCustomHeapProperties in the title's C form (return buffer first)
+ //   heap 9/10 GetCPU/GetGPUDescriptorHandleForHeapStart (Xbox: 8-byte handle in RAX; the PC heap uses the
+ //             hidden return pointer in RDX, so slot 14 wraps it)
+ //   slot 62  CreateComputePipelineState
+@@ -199,6 +200,46 @@ int main(int argc, char** argv) {
+     const LUID real_luid = real ? real->GetAdapterLuid() : LUID{};
+     check(proxy_luid.LowPart == real_luid.LowPart && proxy_luid.HighPart == real_luid.HighPart,
+           "slot 43 forwards GetAdapterLuid (struct return)");
++    // Slots 25 and 26 return a struct wider than 8 bytes. The console title calls them with the C ABI: the hidden
++    // return pointer first (RCX), then the device (RDX), then the arguments, and the buffer comes back in RAX
++    // (measured for slot 26 on the retail executable). Call them that way through raw function pointers and compare
++    // with the PC device's own answers.
++    check(rt::d3d12_xs::device_slot_overridden(25), "device slot 25 is the C-ABI GetResourceAllocationInfo override");
++    check(rt::d3d12_xs::device_slot_overridden(26), "device slot 26 is the C-ABI GetCustomHeapProperties override");
++    if (real) {
++        using HeapPropsFn = D3D12_HEAP_PROPERTIES*(WINAPI*)(D3D12_HEAP_PROPERTIES*, void*, UINT, D3D12_HEAP_TYPE);
++        auto get_heap_props = reinterpret_cast<HeapPropsFn>(proxy_vtbl[26]);
++        for (D3D12_HEAP_TYPE type : {D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_TYPE_READBACK}) {
++            D3D12_HEAP_PROPERTIES got;
++            std::memset(&got, 0xcd, sizeof(got));
++            D3D12_HEAP_PROPERTIES* returned = get_heap_props(&got, device.Get(), 1, type);
++            const D3D12_HEAP_PROPERTIES want = real->GetCustomHeapProperties(1, type);
++            check(returned == &got, "slot 26 returns the caller's buffer in RAX");
++            check(std::memcmp(&got, &want, sizeof(got)) == 0,
++                  "slot 26 (C ABI) writes the PC device's GetCustomHeapProperties into the caller's buffer");
++        }
++
++        using AllocInfoFn = D3D12_RESOURCE_ALLOCATION_INFO*(WINAPI*)(D3D12_RESOURCE_ALLOCATION_INFO*, void*, UINT, UINT,
++                                                                     const D3D12_RESOURCE_DESC*);
++        auto get_alloc_info = reinterpret_cast<AllocInfoFn>(proxy_vtbl[25]);
++        const D3D12_RESOURCE_DESC desc = buffer_desc();
++        D3D12_RESOURCE_ALLOCATION_INFO got{~0ull, ~0ull};
++        D3D12_RESOURCE_ALLOCATION_INFO* returned = get_alloc_info(&got, device.Get(), 0, 1, &desc);
++        const D3D12_RESOURCE_ALLOCATION_INFO want = real->GetResourceAllocationInfo(0, 1, &desc);
++        check(returned == &got, "slot 25 returns the caller's buffer in RAX");
++        check(got.SizeInBytes == want.SizeInBytes && got.Alignment == want.Alignment,
++              "slot 25 (C ABI) writes the PC device's GetResourceAllocationInfo into the caller's buffer");
++
++        // The runtime's own code calls the proxy through d3d12.h (PC form: this, then the return buffer). Both
++        // slots still answer that form.
++        const D3D12_HEAP_PROPERTIES pc_props = device->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
++        const D3D12_HEAP_PROPERTIES pc_want = real->GetCustomHeapProperties(1, D3D12_HEAP_TYPE_UPLOAD);
++        check(std::memcmp(&pc_props, &pc_want, sizeof(pc_props)) == 0, "slot 26 still answers the PC (C++) form");
++        const D3D12_RESOURCE_ALLOCATION_INFO pc_info = device->GetResourceAllocationInfo(0, 1, &desc);
++        check(pc_info.SizeInBytes == want.SizeInBytes && pc_info.Alignment == want.Alignment,
++              "slot 25 still answers the PC (C++) form");
++    }
++
+     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();
+     reserved_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+     ComPtr<ID3D12Resource> reserved;
