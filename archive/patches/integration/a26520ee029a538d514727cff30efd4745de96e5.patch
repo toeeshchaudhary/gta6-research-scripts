@@ -1,0 +1,95 @@
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index f41c09074..c1de73462 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -1411,19 +1411,15 @@ void mock_heap_free(void* ptr, std::uint64_t attributes) {
+ 
+ int check_descriptor_heap_hooks() {
+     g_heap_hook = {};
+-    std::fprintf(stderr, "[heap probe] a\n");
+     xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+ 
+     Mock* real = new_mock(Kind::device);
+     real->refs = 1;
+-    std::fprintf(stderr, "[heap probe] b\n");
+     real->device_level = 9;
+     void* device = nullptr;
+-    std::fprintf(stderr, "[heap probe] c\n");
+     EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(real), __uuidof(ID3D12Device), &device)));
+ 
+     constexpr SIZE_T kCustomBase = 0x77770000ull;
+-    std::fprintf(stderr, "[heap probe] d\n");
+     g_heap_hook.next_ptr = reinterpret_cast<void*>(kCustomBase);
+     D3D12_DESCRIPTOR_HEAP_DESC desc{};
+     desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+@@ -1431,16 +1427,13 @@ int check_descriptor_heap_hooks() {
+     desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+     const IID iid_heap = __uuidof(ID3D12DescriptorHeap);
+     void* heap = nullptr;
+-    std::fprintf(stderr, "[heap probe] e\n");
+     EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))));
+-    std::fprintf(stderr, "[heap probe] f\n");
+     EXPECT(heap != nullptr && xs::is_heap_proxy(heap));
+     EXPECT(g_heap_hook.alloc_calls == 1);
+     EXPECT(g_heap_hook.last_alloc_size == desc.NumDescriptors * kMockDescriptorInc);
+     EXPECT(g_heap_hook.last_alloc_attr == xs::kXmemDescriptorHeapAttributes);
+ 
+     // Slot 9 returns the title-supplied base; slot 10 keeps the real GPU start so (gpu - cpu) delta stays exact.
+-    std::fprintf(stderr, "[heap probe] g\n");
+     EXPECT(raw(heap, 9) == kCustomBase);
+     EXPECT(raw(heap, 10) == kMockHeapGpuStart);
+ 
+@@ -1488,17 +1481,14 @@ int check_descriptor_heap_hooks() {
+            kCustomBase + off3);
+ 
+     // Null return from the hook falls back cleanly to the PC heap's start and never calls free.
+-    std::fprintf(stderr, "[heap probe] d\n");
+     g_heap_hook.next_ptr = nullptr;
+     void* plain_heap = nullptr;
+-    std::fprintf(stderr, "[heap probe] e\n");
+     EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&plain_heap)))));
+     EXPECT(plain_heap != nullptr && raw(plain_heap, 9) == kMockHeapCpuStart);
+     EXPECT(raw(plain_heap, 2) == 0);
+     EXPECT(g_heap_hook.free_calls == 1);
+ 
+     // QI failure on heap proxy creation (unsupported IID) frees the hook backing immediately.
+-    std::fprintf(stderr, "[heap probe] d\n");
+     g_heap_hook.next_ptr = reinterpret_cast<void*>(kCustomBase);
+     void* bad_heap = nullptr;
+     EXPECT(hr_of(raw(device, 14, word(&desc), word(&kExtraIid), word(&bad_heap))) == E_NOINTERFACE);
+@@ -1513,7 +1503,6 @@ int check_descriptor_heap_hooks() {
+     EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase}).ptr == kCustomBase);
+ 
+     EXPECT(raw(device, 2) == 0 && real->refs == 0);
+-    std::fprintf(stderr, "[heap probe] a\n");
+     xs::set_descriptor_heap_allocator(nullptr, nullptr);
+     return 0;
+ }
+@@ -1661,22 +1650,11 @@ int main(int argc, char** argv) {
+         return run_fault_mode(argv[1]);
+     }
+     if (argc != 1) return 2;
+-    std::fprintf(stderr, "[probe] check_tail(true)\n"); if (check_tail(true)) return 1;
+-    std::fprintf(stderr, "[probe] check_levels()\n"); if (check_levels()) return 1;
+-    std::fprintf(stderr, "[probe] check_fence1()\n"); if (check_fence1()) return 1;
+-    std::fprintf(stderr, "[probe] check_create_failures()\n"); if (check_create_failures()) return 1;
+-    std::fprintf(stderr, "[probe] check_open_shared()\n"); if (check_open_shared()) return 1;
+-    std::fprintf(stderr, "[probe] check_alloc_failures()\n"); if (check_alloc_failures()) return 1;
+-    std::fprintf(stderr, "[probe] check_allocators()\n"); if (check_allocators()) return 1;
+-    std::fprintf(stderr, "[probe] check_xbox_slots()\n"); if (check_xbox_slots()) return 1;
+-    std::fprintf(stderr, "[probe] check_custom_heap_properties()\n"); if (check_custom_heap_properties()) return 1;
+-    std::fprintf(stderr, "[probe] check_descriptor_heap_hooks()\n"); if (check_descriptor_heap_hooks()) return 1;
+-    std::fprintf(stderr, "[probe] check_lists()\n"); if (check_lists()) return 1;
+-    std::fprintf(stderr, "[probe] check_signalx_detection()\n"); if (check_signalx_detection()) return 1;
+-    std::fprintf(stderr, "[probe] check_slot70()\n"); if (check_slot70()) return 1;
+-    std::fprintf(stderr, "[probe] check_slot70_raw_buffer()\n"); if (check_slot70_raw_buffer()) return 1;
+-    std::fprintf(stderr, "[probe] check_list_tail_names()\n"); if (check_list_tail_names()) return 1;
+-    std::fprintf(stderr, "[probe] done\n");
++    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
++        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties() ||
++        check_descriptor_heap_hooks() || check_lists() || check_signalx_detection() || check_slot70() ||
++        check_slot70_raw_buffer() || check_list_tail_names())
++        return 1;
+     if (check_placed_resource_x()) return 1;
+     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
+     return 0;
