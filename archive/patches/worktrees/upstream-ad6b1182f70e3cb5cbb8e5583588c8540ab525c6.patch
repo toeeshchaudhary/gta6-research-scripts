@@ -1,0 +1,70 @@
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 1fa7a88c8..8c298c040 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1315,10 +1315,33 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
+                               std::uint64_t params) {
+     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+-    return hr_to_u64(state->xbox->PresentX(
++    const HRESULT presented = state->xbox->PresentX(
+         static_cast<UINT>(plane_count),
+         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
++        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
++    if (call_trace_enabled()) {
++        const auto* plane = reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes);
++        static std::atomic<std::uint64_t> presents{0};
++        D3D12_RESOURCE_DESC source{};
++        const bool have_source = plane && plane_count && plane[0].ppResources && plane[0].ppResources[0];
++        if (have_source) source = plane[0].ppResources[0]->GetDesc();
++        std::fprintf(stderr,
++                     "[trace] present #%llu planes=%llu planes_ptr=%#llx params=%#llx token=%#llx resource_count=%u "
++                     "resource=%#llx dim=%d %llux%u fmt=%u flags=0x%x src_rect=%p -> hr=0x%08lx\n",
++                     static_cast<unsigned long long>(presents.fetch_add(1, std::memory_order_relaxed) + 1),
++                     static_cast<unsigned long long>(plane_count), static_cast<unsigned long long>(planes),
++                     static_cast<unsigned long long>(params),
++                     plane && plane_count ? static_cast<unsigned long long>(plane[0].Token) : 0ull,
++                     plane && plane_count ? unsigned(plane[0].ResourceCount) : 0u,
++                     static_cast<unsigned long long>(
++                         have_source ? reinterpret_cast<std::uintptr_t>(plane[0].ppResources[0]) : 0),
++                     have_source ? int(source.Dimension) : -1,
++                     static_cast<unsigned long long>(have_source ? source.Width : 0), have_source ? source.Height : 0,
++                     have_source ? unsigned(source.Format) : 0, have_source ? unsigned(source.Flags) : 0,
++                     static_cast<const void*>(plane && plane_count ? plane[0].pSrcViewRects : nullptr),
++                     static_cast<unsigned long>(presented));
++    }
++    return hr_to_u64(presented);
+ }
+ 
+ #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
+diff --git a/runtime/shims/xbox_present.cpp b/runtime/shims/xbox_present.cpp
+index 9e20c28d6..2b74726a2 100644
+--- a/runtime/shims/xbox_present.cpp
++++ b/runtime/shims/xbox_present.cpp
+@@ -144,8 +144,11 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
+     // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
+     // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
+     FramePacer::TokenIssue issue{};
+-    if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok)
++    if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok) {
++        std::fprintf(stderr, "[rt] present: PresentX token 0x%llx refused by the pacer (%d)\n",
++                     static_cast<unsigned long long>(token), checked);
+         return from_pacer(checked);
++    }
+     switch (issue) {
+     case FramePacer::TokenIssue::null_token:
+         log_once(logged_null_token_, "PresentX with the null token: presented anyway (real behaviour unmeasured)");
+@@ -249,7 +252,11 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
+     const XboxPresentPlaneParameters& plane = planes[0];
+     ID3D12Resource* resource = plane.ppResources[0];
+     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
++    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
++        std::fprintf(stderr, "[rt] present: PresentX plane resource is not a 2D texture (dimension %d)\n",
++                     int(desc.Dimension));
++        return E_INVALIDARG;
++    }
+     D3D12_HEAP_PROPERTIES heap{};
+     D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+     if (SUCCEEDED(resource->GetHeapProperties(&heap, &heap_flags)) && !(heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY))
