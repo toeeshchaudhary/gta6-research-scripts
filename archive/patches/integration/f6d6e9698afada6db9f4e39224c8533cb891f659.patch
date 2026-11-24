@@ -1,0 +1,849 @@
+diff --git a/runtime/shims/d3d12_xs.cpp b/runtime/shims/d3d12_xs.cpp
+index 81e85dd9e..51241498b 100644
+--- a/runtime/shims/d3d12_xs.cpp
++++ b/runtime/shims/d3d12_xs.cpp
+@@ -117,11 +117,22 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
+     return fn(data, size, iid, out);
+ }
+ 
++void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
++    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
++    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
++}
++
++void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
++    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
++    if (hooks && hooks->free) hooks->free(ptr, attributes);
++}
++
+ // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
+ // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
+ // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
+ // least restrictive floor; higher feature levels are still exposed by the created device.
+ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
++    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
+     constexpr auto method = "D3D12XboxCreateDevice";
+     using rt::d3d12_trace::result;
+     if (!out) return result(method, E_POINTER);
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index ee351cfe6..d7fd88d95 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -46,7 +46,10 @@
+ #include <iterator>
+ #include <mutex>
+ #include <new>
++#include <limits>
+ #include <memory>
++#include <mutex>
++#include <new>
+ #include <utility>
+ #include <vector>
+ 
+@@ -110,8 +113,85 @@ struct HeapProxy {
+     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
+     void** real_vtable;
+     std::atomic<unsigned long> refs;
++    // Non-zero when the title's XMem allocation hook supplied the heap's backing address: slot 9 returns
++    // custom_cpu_start and device descriptor calls translate [custom_cpu_start, +custom_byte_size) to real_cpu_start.
++    SIZE_T custom_cpu_start;
++    SIZE_T custom_byte_size;
++    SIZE_T real_cpu_start;
++    DescriptorHeapBackingFree custom_free;
++};
++
++struct DescriptorRange {
++    SIZE_T custom_start;
++    SIZE_T custom_end;  // exclusive
++    SIZE_T real_start;
++    const DeviceProxy* device;
++    const HeapProxy* heap;
+ };
+ 
++// Immortal: late COM Release calls during process teardown may still unregister a heap or check the table.
++std::mutex& descriptor_range_mutex() {
++    static auto* m = new std::mutex;
++    return *m;
++}
++
++std::vector<DescriptorRange>& descriptor_ranges() {
++    static auto* v = new std::vector<DescriptorRange>;
++    return *v;
++}
++
++std::atomic<std::size_t> g_custom_range_count{0};
++
++std::mutex& heap_alloc_mutex() {
++    static auto* m = new std::mutex;
++    return *m;
++}
++
++DescriptorHeapBackingAlloc g_heap_alloc = nullptr;
++DescriptorHeapBackingFree g_heap_free = nullptr;
++bool g_heap_alloc_explicit = false;
++
++bool register_descriptor_range(const DeviceProxy* device, const HeapProxy* heap, SIZE_T custom_start,
++                               SIZE_T byte_size, SIZE_T real_start) {
++    if (custom_start == 0 || byte_size == 0 || custom_start > (std::numeric_limits<SIZE_T>::max)() - byte_size)
++        return false;
++    try {
++        std::lock_guard lock(descriptor_range_mutex());
++        descriptor_ranges().push_back({custom_start, custom_start + byte_size, real_start, device, heap});
++        g_custom_range_count.store(descriptor_ranges().size(), std::memory_order_release);
++        return true;
++    } catch (const std::bad_alloc&) {
++        return false;
++    }
++}
++
++void unregister_descriptor_range(const HeapProxy* heap) {
++    if (g_custom_range_count.load(std::memory_order_acquire) == 0) return;
++    std::lock_guard lock(descriptor_range_mutex());
++    auto& ranges = descriptor_ranges();
++    for (auto it = ranges.begin(); it != ranges.end();) {
++        if (it->heap == heap) {
++            it = ranges.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    g_custom_range_count.store(ranges.size(), std::memory_order_release);
++}
++
++D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
++    if (handle.ptr == 0 || g_custom_range_count.load(std::memory_order_acquire) == 0) return handle;
++    std::lock_guard lock(descriptor_range_mutex());
++    const auto& ranges = descriptor_ranges();
++    for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
++        if (device && it->device != device) continue;
++        if (handle.ptr >= it->custom_start && handle.ptr < it->custom_end) {
++            return D3D12_CPU_DESCRIPTOR_HANDLE{it->real_start + (handle.ptr - it->custom_start)};
++        }
++    }
++    return handle;
++}
++
+ std::atomic<std::uint64_t> g_hits[kMaxSlots];
+ std::atomic<bool> g_first[kMaxSlots];
+ std::atomic<bool> g_beyond_warned[kMaxSlots];
+@@ -158,6 +238,14 @@ const char* slot_name(unsigned slot) {
+         case 11: return "CreateComputePipelineState (PC slot 11)";
+         case 14: return "CreateDescriptorHeap";
+         case 16: return "CreateRootSignature";
++        case 17: return "CreateConstantBufferView (CPU handle translated)";
++        case 18: return "CreateShaderResourceView (CPU handle translated)";
++        case 19: return "CreateUnorderedAccessView (CPU handle translated)";
++        case 20: return "CreateRenderTargetView (CPU handle translated)";
++        case 21: return "CreateDepthStencilView (CPU handle translated)";
++        case 22: return "CreateSampler (CPU handle translated)";
++        case 23: return "CopyDescriptors (CPU handles translated)";
++        case 24: return "CopyDescriptorsSimple (CPU handles translated)";
+         case 25: return "GetResourceAllocationInfo";
+         case 26: return "GetCustomHeapProperties";
+         case 27: return "CreateCommittedResource (PC slot 27)";
+@@ -518,11 +606,15 @@ unsigned long heap_release(HeapProxy* self) {
+     note_heap_slot(2);
+     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+     if (refs == 0) {
++        if (self->custom_cpu_start != 0) unregister_descriptor_range(self);
++        void* const backing = reinterpret_cast<void*>(self->custom_cpu_start);
++        const DescriptorHeapBackingFree free_fn = self->custom_free;
+         ID3D12DescriptorHeap* real = self->real;
+         DeviceProxy* device = self->device;
+         delete self;
+         if (real) real->Release();
+         if (device) proxy_release(device);
++        if (backing && free_fn) free_fn(backing, kXmemDescriptorHeapAttributes);
+     }
+     return refs;
+ }
+@@ -557,17 +649,21 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
+ // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
+ // 8-byte value in RAX. Call with both conventions and keep whichever produced a value, so a runtime that really
+ // returns in RAX also works. The extra register is harmless when the callee ignores it.
+-D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
+-    note_heap_slot(9);
++D3D12_CPU_DESCRIPTOR_HANDLE raw_heap_get_cpu_handle(ID3D12DescriptorHeap* real, void** real_vtable) {
+     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
+     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+     handle.ptr = kUnset;
+     using Fn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
+-    const D3D12_CPU_DESCRIPTOR_HANDLE returned =
+-        reinterpret_cast<Fn>(self->real_vtable[9])(self->real, &handle);
++    const D3D12_CPU_DESCRIPTOR_HANDLE returned = reinterpret_cast<Fn>(real_vtable[9])(real, &handle);
+     return handle.ptr != kUnset ? handle : returned;
+ }
+ 
++D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
++    note_heap_slot(9);
++    if (self->custom_cpu_start != 0) return D3D12_CPU_DESCRIPTOR_HANDLE{self->custom_cpu_start};
++    return raw_heap_get_cpu_handle(self->real, self->real_vtable);
++}
++
+ D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
+     note_heap_slot(10);
+     constexpr UINT64 kUnset = ~static_cast<UINT64>(0);
+@@ -623,7 +719,9 @@ void** get_heap_vtable() {
+     return vtable;
+ }
+ 
+-HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out) {
++HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
++                          SIZE_T custom_cpu_start = 0, SIZE_T custom_byte_size = 0, SIZE_T real_cpu_start = 0,
++                          DescriptorHeapBackingFree custom_free = nullptr) {
+     if (!real || !device) return E_POINTER;
+     if (!out) return E_POINTER;
+     *out = nullptr;
+@@ -635,11 +733,23 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
+     proxy->device = device;
+     proxy->real_vtable = *reinterpret_cast<void***>(real);
+     proxy->refs.store(1, std::memory_order_relaxed);
++    proxy->custom_cpu_start = custom_cpu_start;
++    proxy->custom_byte_size = custom_byte_size;
++    proxy->real_cpu_start = real_cpu_start;
++    proxy->custom_free = custom_free;
+     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
+ 
++    if (custom_cpu_start != 0 &&
++        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
++        delete proxy;
++        proxy_release(device);
++        return E_OUTOFMEMORY;
++    }
++
+     const HRESULT hr = heap_query_interface(proxy, &riid, out);
+     if (FAILED(hr)) {
+         // No reference escaped, and the caller still owns its references to `real` and `device`.
++        if (custom_cpu_start != 0) unregister_descriptor_range(proxy);
+         delete proxy;
+         proxy_release(device);
+         return hr;
+@@ -2121,11 +2231,129 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
+     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
+ 
+     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
+-    hr = create_heap_proxy(heap, self, *riid, out);
+-    if (FAILED(hr)) heap->Release();
++    SIZE_T custom_cpu_start = 0;
++    SIZE_T custom_byte_size = 0;
++    SIZE_T real_cpu_start = 0;
++    DescriptorHeapBackingAlloc alloc_fn = nullptr;
++    DescriptorHeapBackingFree free_fn = nullptr;
++    {
++        std::lock_guard lock(heap_alloc_mutex());
++        alloc_fn = g_heap_alloc;
++        free_fn = g_heap_free;
++    }
++    if (alloc_fn && desc && desc->NumDescriptors > 0) {
++        const UINT inc = self->real->GetDescriptorHandleIncrementSize(desc->Type);
++        if (inc > 0 && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
++            const SIZE_T byte_size = static_cast<SIZE_T>(desc->NumDescriptors) * static_cast<SIZE_T>(inc);
++            void* backing = alloc_fn(byte_size, kXmemDescriptorHeapAttributes);
++            if (backing) {
++                const auto addr = reinterpret_cast<SIZE_T>(backing);
++                if (addr <= (std::numeric_limits<SIZE_T>::max)() - byte_size) {
++                    custom_cpu_start = addr;
++                    custom_byte_size = byte_size;
++                    real_cpu_start = raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
++                } else if (free_fn) {
++                    free_fn(backing, kXmemDescriptorHeapAttributes);
++                }
++            }
++        }
++    }
++
++    hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
++                           custom_cpu_start ? free_fn : nullptr);
++    if (FAILED(hr)) {
++        heap->Release();
++        if (custom_cpu_start && free_fn)
++            free_fn(reinterpret_cast<void*>(custom_cpu_start), kXmemDescriptorHeapAttributes);
++    }
+     return hr;
+ }
+ 
++// Device slots 17-24 write or copy descriptors using CPU handles. When a title supplies its own descriptor-heap base
++// via __XMemAllocationHooks__, those handles fall in [custom_start, custom_end) and must be translated back to the
++// underlying PC/Vulkan heap before forwarding.
++void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
++                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(17);
++    self->real->CreateConstantBufferView(desc, translate_cpu_handle(self, dest));
++}
++
++void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
++                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(18);
++    self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
++}
++
++void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
++                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(19);
++    self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
++}
++
++void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
++                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(20);
++    self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
++}
++
++void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
++                      D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(21);
++    self->real->CreateDepthStencilView(resource, desc, translate_cpu_handle(self, dest));
++}
++
++void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
++    note_slot(22);
++    self->real->CreateSampler(desc, translate_cpu_handle(self, dest));
++}
++
++void proxy_copy_descriptors(DeviceProxy* self, UINT num_dest, const D3D12_CPU_DESCRIPTOR_HANDLE* dest_starts,
++                            const UINT* dest_sizes, UINT num_src, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
++                            const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type) {
++    note_slot(23);
++    if (g_custom_range_count.load(std::memory_order_acquire) == 0) {
++        self->real->CopyDescriptors(num_dest, dest_starts, dest_sizes, num_src, src_starts, src_sizes, type);
++        return;
++    }
++    constexpr UINT kInline = 32;
++    D3D12_CPU_DESCRIPTOR_HANDLE dest_inline[kInline];
++    D3D12_CPU_DESCRIPTOR_HANDLE src_inline[kInline];
++    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> dest_heap;
++    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> src_heap;
++    const D3D12_CPU_DESCRIPTOR_HANDLE* dest_out = dest_starts;
++    const D3D12_CPU_DESCRIPTOR_HANDLE* src_out = src_starts;
++    try {
++        if (dest_starts && num_dest > 0) {
++            D3D12_CPU_DESCRIPTOR_HANDLE* dst = dest_inline;
++            if (num_dest > kInline) {
++                dest_heap.resize(num_dest);
++                dst = dest_heap.data();
++            }
++            for (UINT i = 0; i < num_dest; ++i) dst[i] = translate_cpu_handle(self, dest_starts[i]);
++            dest_out = dst;
++        }
++        if (src_starts && num_src > 0) {
++            D3D12_CPU_DESCRIPTOR_HANDLE* src = src_inline;
++            if (num_src > kInline) {
++                src_heap.resize(num_src);
++                src = src_heap.data();
++            }
++            for (UINT i = 0; i < num_src; ++i) src[i] = translate_cpu_handle(self, src_starts[i]);
++            src_out = src;
++        }
++    } catch (const std::bad_alloc&) {
++        return;
++    }
++    self->real->CopyDescriptors(num_dest, dest_out, dest_sizes, num_src, src_out, src_sizes, type);
++}
++
++void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D12_CPU_DESCRIPTOR_HANDLE dest_start,
++                                   D3D12_CPU_DESCRIPTOR_HANDLE src_start, D3D12_DESCRIPTOR_HEAP_TYPE type) {
++    note_slot(24);
++    self->real->CopyDescriptorsSimple(num_descriptors, translate_cpu_handle(self, dest_start),
++                                      translate_cpu_handle(self, src_start), type);
++}
++
+ // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
+ // on the package's XboxBvhBuilder.dll (its constructor passes w2 = w3 = 0 and IID_ID3D12PipelineState in the fourth
+ // argument), as the prior art had recorded. Their meaning is unknown; non-zero values are logged once.
+@@ -2347,6 +2575,47 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+         return hr_to_u64(proxy_create_descriptor_heap(
+             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
+             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
++    } else if constexpr (Slot == 17) {
++        proxy_create_cbv(self, reinterpret_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(a1),
++                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
++        return 0;
++    } else if constexpr (Slot == 18) {
++        proxy_create_srv(self, reinterpret_cast<ID3D12Resource*>(a1),
++                         reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(a2),
++                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)});
++        return 0;
++    } else if constexpr (Slot == 19) {
++        proxy_create_uav(self, reinterpret_cast<ID3D12Resource*>(a1), reinterpret_cast<ID3D12Resource*>(a2),
++                         reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(a3),
++                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a4)});
++        return 0;
++    } else if constexpr (Slot == 20) {
++        proxy_create_rtv(self, reinterpret_cast<ID3D12Resource*>(a1),
++                         reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(a2),
++                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)});
++        return 0;
++    } else if constexpr (Slot == 21) {
++        proxy_create_dsv(self, reinterpret_cast<ID3D12Resource*>(a1),
++                         reinterpret_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(a2),
++                         D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)});
++        return 0;
++    } else if constexpr (Slot == 22) {
++        proxy_create_sampler(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1),
++                             D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)});
++        return 0;
++    } else if constexpr (Slot == 23) {
++        proxy_copy_descriptors(self, static_cast<UINT>(a1), reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2),
++                               reinterpret_cast<const UINT*>(a3), static_cast<UINT>(a4),
++                               reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a5),
++                               reinterpret_cast<const UINT*>(a6),
++                               static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<UINT>(a7)));
++        return 0;
++    } else if constexpr (Slot == 24) {
++        proxy_copy_descriptors_simple(self, static_cast<UINT>(a1),
++                                      D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)},
++                                      D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a3)},
++                                      static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<UINT>(a4)));
++        return 0;
+     } else if constexpr (Slot == 62) {
+         return hr_to_u64(proxy_create_compute_pipeline_state(
+             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
+@@ -2541,6 +2810,25 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap) {
+     return static_cast<const HeapProxy*>(heap)->real;
+ }
+ 
++void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free) {
++    std::lock_guard lock(heap_alloc_mutex());
++    g_heap_alloc = alloc;
++    g_heap_free = free;
++    g_heap_alloc_explicit = (alloc != nullptr || free != nullptr);
++}
++
++void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free) {
++    std::lock_guard lock(heap_alloc_mutex());
++    if (g_heap_alloc_explicit) return;
++    g_heap_alloc = alloc;
++    g_heap_free = free;
++}
++
++D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
++    const auto* proxy = is_device_proxy(device) ? static_cast<const DeviceProxy*>(device) : nullptr;
++    return translate_cpu_handle(proxy, handle);
++}
++
+ unsigned device_proxy_slot_count(const void* device) {
+     if (!is_device_proxy(device)) return 0;
+     return static_cast<const DeviceProxy*>(device)->slot_count;
+@@ -2552,7 +2840,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
+ }
+ 
+ bool device_slot_overridden(unsigned slot) {
+-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || slot == 26 || slot == 31 || slot == 32 ||
++    if (slot <= 2 || slot == 8 || slot == 9 || slot == 12 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 26 || slot == 31 || slot == 32 ||
+         slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 ||
+         slot == 67 || slot == 75 || slot == 76 || slot == 133)
+         return true;
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 6a71f3bc9..d05f36183 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -66,6 +66,7 @@
+ 
+ #include <d3d12.h>
+ 
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace rt::d3d12_xs {
+@@ -103,6 +104,20 @@ void* device_proxy_primary(void* device);
+ bool is_heap_proxy(const void* heap);
+ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);
+ 
++// Console D3D12 descriptor heaps allocate their backing through XMem (allocator ID 0x80 = eXALLOCAllocatorId_D3D in
++// bits 16..23, object type 4 in the low 14 bits). A title that intercepts this allocation via __XMemAllocationHooks__
++// returns its own virtual address and expects GetCPUDescriptorHandleForHeapStart() to return that address.
++inline constexpr std::uint64_t kXmemDescriptorHeapAttributes = (0x80ULL << 16) | 4ULL;
++using DescriptorHeapBackingAlloc = void* (*)(std::size_t byte_size, std::uint64_t attributes);
++using DescriptorHeapBackingFree = void (*)(void* ptr, std::uint64_t attributes);
++// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14).
++void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
++// Installs the default bridge (used by D3D12XboxCreateDevice) only when no explicit allocator has been set.
++void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
++// Translates a CPU descriptor handle from a title-backed descriptor heap to the underlying PC/Vulkan heap handle.
++// Returns `handle` unchanged when it does not fall inside any active custom-backed heap.
++D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle);
++
+ // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
+ unsigned device_proxy_slot_count(const void* device);
+ 
+diff --git a/runtime/shims/registry.cpp b/runtime/shims/registry.cpp
+index 047645401..e5f904429 100644
+--- a/runtime/shims/registry.cpp
++++ b/runtime/shims/registry.cpp
+@@ -385,6 +385,11 @@ struct BundledLoaderEntry {
+     const BundledModuleOps* ops;
+ };
+ 
++struct XMemHooksEntry {
++    const void* owner;
++    const XMemAllocationHooks* hooks;
++};
++
+ // Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
+ std::mutex& bundled_loader_mutex() {
+     static auto* m = new std::mutex;
+@@ -396,6 +401,16 @@ std::vector<BundledLoaderEntry>& bundled_loaders() {
+     return *v;
+ }
+ 
++std::mutex& xmem_hooks_mutex() {
++    static auto* m = new std::mutex;
++    return *m;
++}
++
++std::vector<XMemHooksEntry>& xmem_hooks_entries() {
++    static auto* v = new std::vector<XMemHooksEntry>;
++    return *v;
++}
++
+ std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
+     std::lock_guard lock(bundled_loader_mutex());
+     return bundled_loaders();
+@@ -457,6 +472,30 @@ bool owns_bundled_module_handle(void* module) {
+     return false;
+ }
+ 
++void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
++    if (!owner || !hooks) return;
++    std::lock_guard lock(xmem_hooks_mutex());
++    xmem_hooks_entries().push_back({owner, hooks});
++}
++
++void remove_xmem_allocation_hooks(const void* owner) {
++    std::lock_guard lock(xmem_hooks_mutex());
++    auto& list = xmem_hooks_entries();
++    for (auto it = list.begin(); it != list.end();) {
++        if (it->owner == owner) {
++            it = list.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++const XMemAllocationHooks* xmem_allocation_hooks() {
++    std::lock_guard lock(xmem_hooks_mutex());
++    const auto& list = xmem_hooks_entries();
++    return list.empty() ? nullptr : list.back().hooks;
++}
++
+ Table::Table(const Entry* entries, size_t count) {
+     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
+ }
+diff --git a/runtime/shims/shims.h b/runtime/shims/shims.h
+index e317ec298..a5059f674 100644
+--- a/runtime/shims/shims.h
++++ b/runtime/shims/shims.h
+@@ -74,6 +74,19 @@ void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& ha
+ void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
+ bool owns_bundled_module_handle(void* module);
+ 
++// Title-exported __XMemAllocationHooks__ (GDK XMEM_ALLOCATION_HOOKS): the console runtime routes internal
++// allocations (including D3D12 descriptor heaps) through these callbacks when the mapped image exports the struct.
++// Registered by Loader after relocations and removed in Loader::~Loader.
++using XMemAllocHookFn = void*(__stdcall*)(size_t size, uint64_t attributes);
++using XMemFreeHookFn = void(__stdcall*)(void* ptr, uint64_t attributes);
++struct XMemAllocationHooks {
++    XMemAllocHookFn alloc;
++    XMemFreeHookFn free;
++};
++void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks);
++void remove_xmem_allocation_hooks(const void* owner);
++const XMemAllocationHooks* xmem_allocation_hooks();
++
+ // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
+ // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).
+ using TestHook = void (*)(const void* return_address_slot);
+diff --git a/runtime/src/pe_loader.cpp b/runtime/src/pe_loader.cpp
+index 680a70065..38b294a34 100644
+--- a/runtime/src/pe_loader.cpp
++++ b/runtime/src/pe_loader.cpp
+@@ -1225,6 +1225,7 @@ Loader::~Loader() {
+             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
+         }
+     }
++    shims::remove_xmem_allocation_hooks(this);
+     shims::remove_bundled_loader(this);
+     shims::remove_module_lookup(this);
+     for (auto* m : order_) {
+@@ -1578,6 +1579,12 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string&
+     // installed here, before bind_imports can return control to the caller and before any image code can run.
+     initialize_tls(*m);
+     parse_exports(*m);
++    if (auto it = m->exports.find("__XMemAllocationHooks__"); it != m->exports.end()) {
++        const auto offset = static_cast<uint64_t>(static_cast<uint8_t*>(it->second) - m->base);
++        if (offset <= m->size && m->size - offset >= sizeof(shims::XMemAllocationHooks)) {
++            shims::add_xmem_allocation_hooks(this, static_cast<const shims::XMemAllocationHooks*>(it->second));
++        }
++    }
+     return *m;
+ }
+ 
+diff --git a/runtime/test/device_proxy_test.cpp b/runtime/test/device_proxy_test.cpp
+index 483f10844..125fb2a13 100644
+--- a/runtime/test/device_proxy_test.cpp
++++ b/runtime/test/device_proxy_test.cpp
+@@ -603,6 +603,71 @@ int main(int argc, char** argv) {
+         check(hr == E_INVALIDARG && !none, "slot 48 refuses a null description with a null output");
+     }
+ 
++    // Title-exported __XMemAllocationHooks__ backing for CreateDescriptorHeap (slot 14) + CPU handle translation
++    // against the real WARP D3D12 runtime.
++    {
++        struct HookState {
++            alignas(64) std::uint8_t backing[4096]{};
++            std::size_t alloc_size = 0;
++            std::uint64_t alloc_attr = 0;
++            void* freed_ptr = nullptr;
++            std::uint64_t freed_attr = 0;
++            int alloc_count = 0;
++            int free_count = 0;
++        };
++        static HookState hook_state;
++        hook_state = {};
++        struct HookCallbacks {
++            static void* __stdcall alloc(std::size_t size, std::uint64_t attr) {
++                ++hook_state.alloc_count;
++                hook_state.alloc_size = size;
++                hook_state.alloc_attr = attr;
++                if ((attr & 0x3FFFull) == 4 && size <= sizeof(hook_state.backing)) return hook_state.backing;
++                return nullptr;
++            }
++            static void __stdcall free(void* ptr, std::uint64_t attr) {
++                ++hook_state.free_count;
++                hook_state.freed_ptr = ptr;
++                hook_state.freed_attr = attr;
++            }
++        };
++        const rt::shims::XMemAllocationHooks title_hooks{&HookCallbacks::alloc, &HookCallbacks::free};
++        rt::shims::add_xmem_allocation_hooks(&title_hooks, &title_hooks);
++
++        D3D12_DESCRIPTOR_HEAP_DESC hooked_desc{};
++        hooked_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++        hooked_desc.NumDescriptors = 4;
++        hooked_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++        const UINT inc = device->GetDescriptorHandleIncrementSize(hooked_desc.Type);
++        ComPtr<ID3D12DescriptorHeap> hooked_heap;
++        hr = device->CreateDescriptorHeap(&hooked_desc, IID_PPV_ARGS(hooked_heap.GetAddressOf()));
++        check(SUCCEEDED(hr) && hooked_heap != nullptr, "hooked slot 14 creates a descriptor heap");
++        check(hook_state.alloc_count == 1 && hook_state.alloc_size == hooked_desc.NumDescriptors * inc &&
++                  hook_state.alloc_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
++              "slot 14 invokes __XMemAllocationHooks__ with heap byte size and D3D descriptor-heap attributes");
++        if (hooked_heap) {
++            void** hooked_vtbl = *reinterpret_cast<void***>(hooked_heap.Get());
++            const auto hooked_cpu = reinterpret_cast<GetCpuHandleFn>(hooked_vtbl[9])(hooked_heap.Get());
++            const auto hooked_gpu = reinterpret_cast<GetGpuHandleFn>(hooked_vtbl[10])(hooked_heap.Get());
++            const auto expected_base = reinterpret_cast<SIZE_T>(hook_state.backing);
++            check(hooked_cpu.ptr == expected_base,
++                  "hooked heap slot 9 returns the title-supplied CPU descriptor base");
++            check(hooked_gpu.ptr != 0, "hooked heap slot 10 returns a valid GPU descriptor start");
++
++            // Create a CBV at slot 1 of the title-backed heap; WARP validates the translated real handle.
++            D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
++            cbv.BufferLocation = 0;
++            cbv.SizeInBytes = 256;
++            device->CreateConstantBufferView(&cbv, D3D12_CPU_DESCRIPTOR_HANDLE{expected_base + inc});
++            check(true, "CreateConstantBufferView translates a title-backed CPU descriptor handle on WARP");
++        }
++        hooked_heap.Reset();
++        check(hook_state.free_count == 1 && hook_state.freed_ptr == hook_state.backing &&
++                  hook_state.freed_attr == rt::d3d12_xs::kXmemDescriptorHeapAttributes,
++              "releasing the hooked heap frees its backing through __XMemAllocationHooks__");
++        rt::shims::remove_xmem_allocation_hooks(&title_hooks);
++    }
++
+     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
+     if (real) real->AddRef();
+     // Drop every device child before the proxy so the PC device is not released first.
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index 8851ee5b7..9058a22d0 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -71,12 +71,15 @@ namespace xs = rt::d3d12_xs;
+ 
+ // ---- Mocks ----
+ 
+-enum class Kind { device, queue, fence, resource, allocator, command_list, list };
++enum class Kind { device, queue, fence, resource, allocator, command_list, list, heap };
+ 
+ constexpr unsigned kMockSlots = 128;
+ constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
+ constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
+ constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
++constexpr SIZE_T kMockHeapCpuStart = 0x55550000ull;
++constexpr UINT64 kMockHeapGpuStart = 0x66660000ull;
++constexpr UINT kMockDescriptorInc = 32;
+ // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
+ constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
+ 
+@@ -162,6 +165,7 @@ bool mock_has(const Mock* m, REFIID iid) {
+             for (const IID& list_iid : lists) if (IsEqualIID(iid, list_iid)) return true;
+             return false;
+         }
++        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
+         default: return false;
+     }
+ }
+@@ -204,6 +208,12 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
+             // Slot 12 (CreateCommandList) never reaches this switch: the device vtable's slot is the dedicated
+             // mock_create_command_list, which needs the sixth word the generic thunk does not declare on some
+             // builds and which picks the list mock's chain breadth from full_chain_lists.
++            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));      // CreateDescriptorHeap
++            case 15: return kMockDescriptorInc;                                                  // GetDescriptorHandleIncrementSize
++            case 23:                                                                             // CopyDescriptors
++                copy_array(m, 23, a2, a1);                                                       // dest starts
++                copy_array(m, 24, words[4], a4);                                                 // src starts (recorded in slot 24's array)
++                break;
+             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
+             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
+             case 32:                                                                          // OpenSharedHandle
+@@ -235,6 +245,14 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
+         const bool is_mock = at >= base && at < base + sizeof(g_pool) && (at - base) % sizeof(Mock) == 0;
+         if (!is_mock) *reinterpret_cast<UINT64*>(a1) = 1000000;
+     }
++    if (m->kind == Kind::heap && slot == 9) {
++        if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
++        return kMockHeapCpuStart;
++    }
++    if (m->kind == Kind::heap && slot == 10) {
++        if (a1) reinterpret_cast<D3D12_GPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapGpuStart;
++        return kMockHeapGpuStart;
++    }
+     return S_OK;
+ }
+ 
+@@ -1231,6 +1249,125 @@ int check_tail(bool want_guarded) {
+     return 0;
+ }
+ 
++struct HeapHookState {
++    void* next_ptr = nullptr;
++    std::size_t last_alloc_size = 0;
++    std::uint64_t last_alloc_attr = 0;
++    int alloc_calls = 0;
++    void* last_free_ptr = nullptr;
++    std::uint64_t last_free_attr = 0;
++    int free_calls = 0;
++} g_heap_hook;
++
++void* mock_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
++    ++g_heap_hook.alloc_calls;
++    g_heap_hook.last_alloc_size = byte_size;
++    g_heap_hook.last_alloc_attr = attributes;
++    return g_heap_hook.next_ptr;
++}
++
++void mock_heap_free(void* ptr, std::uint64_t attributes) {
++    ++g_heap_hook.free_calls;
++    g_heap_hook.last_free_ptr = ptr;
++    g_heap_hook.last_free_attr = attributes;
++}
++
++int check_descriptor_heap_hooks() {
++    g_heap_hook = {};
++    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
++
++    Mock* real = new_mock(Kind::device);
++    real->refs = 1;
++    real->device_level = 9;
++    void* device = nullptr;
++    EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(real), __uuidof(ID3D12Device), &device)));
++
++    constexpr SIZE_T kCustomBase = 0x77770000ull;
++    g_heap_hook.next_ptr = reinterpret_cast<void*>(kCustomBase);
++    D3D12_DESCRIPTOR_HEAP_DESC desc{};
++    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    desc.NumDescriptors = 8;
++    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    const IID iid_heap = __uuidof(ID3D12DescriptorHeap);
++    void* heap = nullptr;
++    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))));
++    EXPECT(heap != nullptr && xs::is_heap_proxy(heap));
++    EXPECT(g_heap_hook.alloc_calls == 1);
++    EXPECT(g_heap_hook.last_alloc_size == desc.NumDescriptors * kMockDescriptorInc);
++    EXPECT(g_heap_hook.last_alloc_attr == xs::kXmemDescriptorHeapAttributes);
++
++    // Slot 9 returns the title-supplied base; slot 10 keeps the real GPU start so (gpu - cpu) delta stays exact.
++    EXPECT(raw(heap, 9) == kCustomBase);
++    EXPECT(raw(heap, 10) == kMockHeapGpuStart);
++
++    // Public translator and device slots 17-24 remap handles in [kCustomBase, +256) to kMockHeapCpuStart + offset.
++    const SIZE_T off3 = 3 * kMockDescriptorInc;
++    const SIZE_T off7 = 7 * kMockDescriptorInc;
++    const SIZE_T outside = kCustomBase + desc.NumDescriptors * kMockDescriptorInc;
++    EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase + off3}).ptr ==
++           kMockHeapCpuStart + off3);
++    EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{outside}).ptr == outside);
++
++    raw(device, 17, 0x11, kCustomBase + off3);                                          // CreateConstantBufferView
++    EXPECT(real->args[17][1] == kMockHeapCpuStart + off3);
++    raw(device, 18, 0x22, 0x33, kCustomBase + off3);                                    // CreateShaderResourceView
++    EXPECT(real->args[18][2] == kMockHeapCpuStart + off3);
++    raw(device, 19, 0x22, 0x33, 0x44, kCustomBase + off7);                              // CreateUnorderedAccessView
++    EXPECT(real->args[19][3] == kMockHeapCpuStart + off7);
++    raw(device, 20, 0x22, 0x33, kCustomBase + off3);                                    // CreateRenderTargetView
++    EXPECT(real->args[20][2] == kMockHeapCpuStart + off3);
++    raw(device, 21, 0x22, 0x33, kCustomBase + off7);                                    // CreateDepthStencilView
++    EXPECT(real->args[21][2] == kMockHeapCpuStart + off7);
++    raw(device, 22, 0x55, kCustomBase + off3);                                          // CreateSampler
++    EXPECT(real->args[22][1] == kMockHeapCpuStart + off3);
++    raw(device, 24, 1, kCustomBase + off7, kCustomBase + off3, 0);                      // CopyDescriptorsSimple
++    EXPECT(real->args[24][1] == kMockHeapCpuStart + off7);
++    EXPECT(real->args[24][2] == kMockHeapCpuStart + off3);
++    {
++        D3D12_CPU_DESCRIPTOR_HANDLE dsts[2] = {{kCustomBase + off3}, {outside}};
++        D3D12_CPU_DESCRIPTOR_HANDLE srcs[2] = {{kCustomBase + off7}, {0x99990000ull}};
++        UINT sizes[2] = {1, 1};
++        static_cast<ID3D12Device*>(device)->CopyDescriptors(2, dsts, sizes, 2, srcs, sizes,
++                                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++        EXPECT(real->array[23][0] == kMockHeapCpuStart + off3 && real->array[23][1] == outside);
++        EXPECT(real->array[24][0] == kMockHeapCpuStart + off7 && real->array[24][1] == 0x99990000ull);
++    }
++
++    // Releasing the heap unregisters the range and invokes the free callback with the same attribute word.
++    EXPECT(raw(heap, 2) == 0);
++    EXPECT(g_heap_hook.free_calls == 1);
++    EXPECT(g_heap_hook.last_free_ptr == reinterpret_cast<void*>(kCustomBase));
++    EXPECT(g_heap_hook.last_free_attr == xs::kXmemDescriptorHeapAttributes);
++    EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase + off3}).ptr ==
++           kCustomBase + off3);
++
++    // Null return from the hook falls back cleanly to the PC heap's start and never calls free.
++    g_heap_hook.next_ptr = nullptr;
++    void* plain_heap = nullptr;
++    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&plain_heap)))));
++    EXPECT(plain_heap != nullptr && raw(plain_heap, 9) == kMockHeapCpuStart);
++    EXPECT(raw(plain_heap, 2) == 0);
++    EXPECT(g_heap_hook.free_calls == 1);
++
++    // QI failure on heap proxy creation (unsupported IID) frees the hook backing immediately.
++    g_heap_hook.next_ptr = reinterpret_cast<void*>(kCustomBase);
++    void* bad_heap = nullptr;
++    EXPECT(hr_of(raw(device, 14, word(&desc), word(&kExtraIid), word(&bad_heap))) == E_NOINTERFACE);
++    EXPECT(bad_heap == nullptr && g_heap_hook.free_calls == 2);
++    EXPECT(g_heap_hook.last_free_ptr == reinterpret_cast<void*>(kCustomBase));
++
++    // OOM on HeapProxy allocation frees the hook backing and leaves no dangling range.
++    g_fail_news = 1;
++    void* oom_heap = nullptr;
++    EXPECT(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&oom_heap))) == E_OUTOFMEMORY);
++    EXPECT(oom_heap == nullptr && g_heap_hook.free_calls == 3);
++    EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{kCustomBase}).ptr == kCustomBase);
++
++    EXPECT(raw(device, 2) == 0 && real->refs == 0);
++    xs::set_descriptor_heap_allocator(nullptr, nullptr);
++    return 0;
++}
++
+ // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
+ 
+ std::atomic<int> g_injected{0};
+@@ -1374,7 +1511,7 @@ int main(int argc, char** argv) {
+     }
+     if (argc != 1) return 2;
+     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties() || check_lists() ||
++        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties() || check_descriptor_heap_hooks() || check_lists() ||
+         check_signalx_detection() || check_list_tail_names())
+         return 1;
+     if (check_placed_resource_x()) return 1;
