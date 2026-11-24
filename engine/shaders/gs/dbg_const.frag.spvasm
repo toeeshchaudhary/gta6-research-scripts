@@ -1,0 +1,21 @@
+; diagnostic constant-color fragment shader: isolates geometry/VS problems
+; from the game PS. Not part of the M2 deliverable.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out Location 0
+       %void = OpTypeVoid
+       %func = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %vec4 = OpTypeVector %float 4
+    %float_0 = OpConstant %float 0.0
+    %float_1 = OpConstant %float 1.0
+   %green = OpConstantComposite %vec4 %float_0 %float_1 %float_0 %float_1
+    %ptr_o = OpTypePointer Output %vec4
+        %out = OpVariable %ptr_o Output
+       %main = OpFunction %void None %func
+      %entry = OpLabel
+               OpStore %out %green
+               OpReturn
+               OpFunctionEnd
