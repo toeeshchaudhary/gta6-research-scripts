@@ -1,0 +1,125 @@
+; GTA6 engine fragment shader (hand-written SPIR-V assembly).
+; Samples the real game texture, does two-sided directional + hemisphere lighting
+; and writes sRGB-encoded output. UBO: lightDir, camPos, params(x = srgb flag).
+               OpCapability Shader
+        %ext = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %i_nrm %i_uv %i_world %front %out_color
+               OpExecutionMode %main OriginUpperLeft
+               OpName %main "main"
+               OpName %ubo "ubo"
+               OpMemberName %ubo 0 "lightDir"
+               OpMemberName %ubo 1 "camPos"
+               OpMemberName %ubo 2 "params"
+               OpDecorate %i_nrm Location 0
+               OpDecorate %i_uv Location 1
+               OpDecorate %i_world Location 2
+               OpDecorate %front BuiltIn FrontFacing
+               OpDecorate %out_color Location 0
+               OpDecorate %ubo_var DescriptorSet 0
+               OpDecorate %ubo_var Binding 0
+               OpDecorate %ubo Block
+               OpMemberDecorate %ubo 0 Offset 0
+               OpMemberDecorate %ubo 1 Offset 16
+               OpMemberDecorate %ubo 2 Offset 32
+               OpDecorate %tex_var DescriptorSet 0
+               OpDecorate %tex_var Binding 1
+      %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %v2f = OpTypeVector %float 2
+        %v3f = OpTypeVector %float 3
+        %v4f = OpTypeVector %float 4
+       %bool = OpTypeBool
+       %uint = OpTypeInt 32 0
+     %uint0 = OpConstant %uint 0
+     %uint1 = OpConstant %uint 1
+     %uint2 = OpConstant %uint 2
+    %float0 = OpConstant %float 0
+  %float0_5 = OpConstant %float 0.5
+  %float0_85 = OpConstant %float 0.85
+  %float1 = OpConstant %float 1
+  %float2_2 = OpConstant %float 2.2
+  %float1_22 = OpConstant %float 0.45454545
+  %float48 = OpConstant %float 48
+  %float0_3 = OpConstant %float 0.3
+ %floatneg1 = OpConstant %float -1
+  %float1_25 = OpConstant %float 1.25
+        %ubo = OpTypeStruct %v4f %v4f %v4f
+      %ptr_ubo = OpTypePointer Uniform %ubo
+   %ptr_ubov = OpTypePointer Uniform %v4f
+   %ptr_ubof = OpTypePointer Uniform %float
+        %img = OpTypeImage %float 2D 0 0 0 1 Unknown
+    %sampled = OpTypeSampledImage %img
+   %ptr_samp = OpTypePointer UniformConstant %sampled
+   %ptr_in3 = OpTypePointer Input %v3f
+   %ptr_in2 = OpTypePointer Input %v2f
+  %ptr_front = OpTypePointer Input %bool
+  %ptr_out4 = OpTypePointer Output %v4f
+    %ground = OpConstantComposite %v3f %float0 %float0 %float0
+       %sky = OpConstantComposite %v3f %float1 %float1 %float1
+   %ubo_var = OpVariable %ptr_ubo Uniform
+   %tex_var = OpVariable %ptr_samp UniformConstant
+     %i_nrm = OpVariable %ptr_in3 Input
+      %i_uv = OpVariable %ptr_in2 Input
+   %i_world = OpVariable %ptr_in3 Input
+     %front = OpVariable %ptr_front Input
+ %out_color = OpVariable %ptr_out4 Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+    %lptr0 = OpAccessChain %ptr_ubov %ubo_var %uint0
+    %lptr1 = OpAccessChain %ptr_ubov %ubo_var %uint1
+    %lptr2 = OpAccessChain %ptr_ubof %ubo_var %uint2 %uint0
+        %uv = OpLoad %v2f %i_uv
+       %tex = OpLoad %sampled %tex_var
+    %samp4 = OpImageSampleImplicitLod %v4f %tex %uv
+     %samp3 = OpVectorShuffle %v3f %samp4 %samp4 0 1 2
+     %srgb = OpLoad %float %lptr2
+    %islin = OpFOrdLessThan %bool %srgb %float0_5
+      %exp2 = OpCompositeConstruct %v3f %float2_2 %float2_2 %float2_2
+      %lin3 = OpExtInst %v3f %ext Pow %samp3 %exp2
+      %linf = OpSelect %float %islin %float1 %float0
+    %linf3 = OpCompositeConstruct %v3f %linf %linf %linf
+     %alb0 = OpExtInst %v3f %ext FMix %samp3 %lin3 %linf3
+        %n0 = OpLoad %v3f %i_nrm
+         %N = OpExtInst %v3f %ext Normalize %n0
+     %isFrt = OpLoad %bool %front
+      %sgn = OpSelect %float %isFrt %float1 %floatneg1
+         %N2 = OpVectorTimesScalar %v3f %N %sgn
+     %ldir4 = OpLoad %v4f %lptr0
+     %ldir3 = OpVectorShuffle %v3f %ldir4 %ldir4 0 1 2
+          %L = OpExtInst %v3f %ext Normalize %ldir3
+       %ndl0 = OpDot %float %N2 %L
+      %ndl = OpExtInst %float %ext FMax %ndl0 %float0
+      %cpos4 = OpLoad %v4f %lptr1
+      %cpos3 = OpVectorShuffle %v3f %cpos4 %cpos4 0 1 2
+        %wp = OpLoad %v3f %i_world
+        %vd = OpFSub %v3f %cpos3 %wp
+         %V = OpExtInst %v3f %ext Normalize %vd
+        %Hv = OpFAdd %v3f %V %L
+         %H = OpExtInst %v3f %ext Normalize %Hv
+      %ndh0 = OpDot %float %N2 %H
+      %ndh = OpExtInst %float %ext FMax %ndh0 %float0
+    %spec0 = OpExtInst %float %ext Pow %ndh %float48
+      %spec = OpFMul %float %spec0 %float0_3
+     %spec3 = OpCompositeConstruct %v3f %spec %spec %spec
+        %ny = OpCompositeExtract %float %N2 1
+      %skyf = OpFMul %float %ny %float0_5
+     %skyf2 = OpFAdd %float %skyf %float0_5
+    %skyf3 = OpCompositeConstruct %v3f %skyf2 %skyf2 %skyf2
+     %gnd3 = OpCompositeConstruct %v3f %float0 %float0 %float0
+     %sky3 = OpCompositeConstruct %v3f %float1 %float1 %float1
+      %amb0 = OpExtInst %v3f %ext FMix %gnd3 %sky3 %skyf3
+     %amb1 = OpVectorTimesScalar %v3f %amb0 %float0_85
+      %dirl = OpFMul %float %ndl %float0_85
+     %dirl3 = OpCompositeConstruct %v3f %dirl %dirl %dirl
+       %sum = OpFAdd %v3f %amb1 %dirl3
+     %ambc = OpFMul %v3f %alb0 %sum
+      %col0 = OpFAdd %v3f %ambc %spec3
+   %expo = OpVectorTimesScalar %v3f %col0 %float1_25
+      %pow3 = OpCompositeConstruct %v3f %float1_22 %float1_22 %float1_22
+      %col1 = OpExtInst %v3f %ext Pow %expo %pow3
+     %col4 = OpCompositeConstruct %v4f %col1 %float1
+               OpStore %out_color %col4
+               OpReturn
+               OpFunctionEnd
