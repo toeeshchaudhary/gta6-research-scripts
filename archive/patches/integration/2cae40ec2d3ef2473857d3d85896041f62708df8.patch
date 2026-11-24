@@ -1,0 +1,107 @@
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 3ca47221f..4c27bf19e 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -1551,7 +1551,7 @@ D3D12_RESOURCE_STATES console_initial_state(const D3D12_RESOURCE_DESC& desc, D3D
+         if ((writes == D3D12_RESOURCE_STATE_RENDER_TARGET && (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) ||
+             (writes == D3D12_RESOURCE_STATE_UNORDERED_ACCESS && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) ||
+             (writes == D3D12_RESOURCE_STATE_DEPTH_WRITE && (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+-            return state;
++            return static_cast<D3D12_RESOURCE_STATES>(kept);  // the buffer bits beside it are dropped
+     }
+     if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return D3D12_RESOURCE_STATE_RENDER_TARGET;
+     if (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+@@ -5647,6 +5647,23 @@ public:
+                                                         identity()));
+     }
+ 
++    // The console numbers its own indirect argument types past the public set (D3D12Xbox's enum): the retail boot
++    // creates five signatures in one step and its third passes 105 (0x69) with a 12-byte stride, beside its draw
++    // (0, 16 bytes), draw-indexed (1, 20 bytes), dispatch (2, 12 bytes) and mesh dispatch (10, 12 bytes). The public
++    // set has no other 12-byte argument than a dispatch, so an argument type no public one names is answered by the
++    // argument size its own ByteStride carries: 12 DISPATCH, 16 DRAW, 20 DRAW_INDEXED, 24 DISPATCH_RAYS. HYPOTHESIS
++    // until the first ExecuteIndirect shows which pipeline the title binds for such a signature.
++    static bool console_argument_type(UINT type, UINT stride, D3D12_INDIRECT_ARGUMENT_TYPE& mapped) {
++        if (type <= UINT(D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT)) return false;
++        switch (stride) {
++        case sizeof(D3D12_DISPATCH_ARGUMENTS): mapped = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH; return true;
++        case sizeof(D3D12_DRAW_ARGUMENTS): mapped = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW; return true;
++        case sizeof(D3D12_DRAW_INDEXED_ARGUMENTS): mapped = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED; return true;
++        case sizeof(D3D12_DISPATCH_RAYS_DESC): mapped = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS; return true;
++        default: return false;
++        }
++    }
++
+     HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                                      ID3D12RootSignature* root_signature, REFIID riid,
+                                                      void** out) override {
+@@ -5656,6 +5673,18 @@ public:
+         // arguments, and a stride that is a multiple of 4 and holds every argument.
+         if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || (desc->NodeMask & ~1u))
+             return E_INVALIDARG;
++        // Console argument types are replaced on a copy, so the checks below see public ones only.
++        std::vector<D3D12_INDIRECT_ARGUMENT_DESC> translated(desc->pArgumentDescs,
++                                                             desc->pArgumentDescs + desc->NumArgumentDescs);
++        D3D12_COMMAND_SIGNATURE_DESC effective = *desc;
++        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
++            D3D12_INDIRECT_ARGUMENT_TYPE mapped{};
++            if (!console_argument_type(UINT(desc->pArgumentDescs[i].Type), desc->ByteStride, mapped)) continue;
++            log_once("console indirect argument type mapped by its stride:", int(desc->pArgumentDescs[i].Type));
++            translated[i].Type = mapped;
++        }
++        effective.pArgumentDescs = translated.data();
++        desc = &effective;
+         UINT64 size = 0;  // 64-bit: a large Num32BitValuesToSet must not wrap past ByteStride
+         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+             const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
+@@ -5688,6 +5717,9 @@ public:
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
+         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
++        // A mesh dispatch carries the same three group counts and is replayed as a dispatch for now: the list's
++        // IndirectKind has no mesh entry, and what differs is the indirect call the replay records, not the data.
++        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: kind = leonida::IndirectKind::dispatch; break;
+         default: return E_NOTIMPL;
+         }
+         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+@@ -8156,7 +8188,11 @@ private:
+                      int(desc->Dimension));
+             return finish(E_INVALIDARG);
+         }
+-        return finish(create_committed(heap, heap_flags, desc, initial, castable_count, castable, riid, out));
++        const HRESULT created = finish(create_committed(heap, heap_flags, desc, initial, castable_count, castable, riid, out));
++        if (FAILED(created))
++            log_once((std::string(method ? method : "CreateCommittedResource") + " creation failed, state").c_str(),
++                     int(initial));
++        return created;
+     }
+ 
+     // Shared by CreateCommittedResource, CreateCommittedResource3 and CreateReservedResource*. A castable-format list
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 7884233da..5b8735abb 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -3235,7 +3235,22 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                  std::uint64_t, std::uint64_t, std::uint64_t);
+         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
++        const std::uint64_t result = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
++        if constexpr (Slot == 41) {  // CreateCommandSignature probe
++            const auto* sig = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1);
++            unsigned words[6] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
++            if (sig && sig->pArgumentDescs) {
++                const auto* raw_desc = reinterpret_cast<const unsigned*>(sig->pArgumentDescs);
++                for (int k = 0; k < 6; ++k) words[k] = raw_desc[k];
++            }
++            std::fprintf(stderr,
++                         "[rt] d3d12_xs: slot 41 -> 0x%08lx (stride %u args %u node %u root %p) desc %08x %08x %08x "
++                         "%08x %08x %08x\n",
++                         static_cast<unsigned long>(static_cast<std::uint32_t>(result)), sig ? sig->ByteStride : 0u,
++                         sig ? sig->NumArgumentDescs : 0u, sig ? sig->NodeMask : 0u,
++                         reinterpret_cast<const void*>(a2), words[0], words[1], words[2], words[3], words[4], words[5]);
++        }
++        return result;
+     }
+ }
+ 
