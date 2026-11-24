@@ -1,0 +1,7 @@
+LIBRARY xapu
+EXPORTS
+    XApuConnect
+    XApuDequeueResult
+    XApuDisconnect
+    XApuEnqueueCommand
+    XApuGetResultCount
