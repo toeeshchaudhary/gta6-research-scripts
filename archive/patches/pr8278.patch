@@ -1,0 +1,747 @@
+﻿diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index aae8591bf4..2edca708a8 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -775,8 +775,9 @@ The compute path, end to end:
+   - Shader programs (FSSM blobs) are copied in as the code base.
+ - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
+   `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
+-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
+-  translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
++  table; section 3.5, D3D-448, spilling trailing compute parameters past `s31` into the `s[0:1]` spill array staged in
++  the GPU address arena). A signature neither can place (such as exceeding the 64-dword D3D12 cost limit) is refused with
++  both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
+   invalidates the list. Before
+   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
+   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
+@@ -1708,8 +1709,9 @@ Taken together this disagrees with the packing above (from s0, two dwords per ta
+ **Console layout, measured for compute (D3D-448).** `rt::rootsig::pack_stage` lays the parameters out for one stage:
+ in root order from the stage base, each while it fits whole, a constant taking one dword per value, a root
+ CBV/SRV/UAV two (its 64-bit VA), a descriptor table **one** (the 32-bit VA of its first descriptor; the heaps live
+-below 4 GiB). A parameter that does not fit goes, with every later one, to the spill array behind `s[0:1]`
+-(section 7), which is not modelled, so such a signature is refused. How each part is known:
++below 4 GiB). A parameter that does not fit goes, with every later one, to the packed spill array behind `s[0:1]`
++(section 7); `pack_stage(Stage::Compute)` models that spill array and the compute path stages it in the GPU address
++arena (`s[0:1]`), while non-compute stages still refuse spills. How each part is known:
+ - **Compute, base s4: measured three ways.**
+   - The console compiler's output (section 7).
+   - The package's FidelityFX DLL, whose 29 compute containers carry their `RTS0` next to the console-compiled
+@@ -1730,8 +1732,9 @@ pipeline reads `s0..s31` from one push-constant block at offset 0 (`tools/rdna2s
+ the same root argument at two offsets. That needs per-stage user-data windows in the translator's push-constant
+ contract (D3D-448 follow-up). A root signature carries both layouts; one that only one of them can place is
+ created, and binding it at the other bind point invalidates the command list (`Close` returns `E_INVALIDARG`).
+-`s0..s3` of a compute dispatch are the driver's block; the layer leaves them zero (109 CS read `s1` as a constant,
+-42 `s3`; their meaning is open).
++`s0..s3` of a compute dispatch are the driver's block; when a signature spills, the layer places the spill array's
++console VA in `s[0:1]` and leaves `s2..s3` zero, whereas non-spilling dispatches leave `s0..s3` zero (109 CS read
++`s1` as a constant, 42 `s3`; their non-spill meaning is open).
+ 
+ **Measured: a real signature beside the count it produced.** `tools/fspx_unpack.py` decodes `COMPUTE_PGM_RSRC2` of
+ each of the 29 compute programs in `amd_fidelityfx_upscaler_xbox.dll`, and its `USER_SGPR` field is the count the
+@@ -1770,9 +1773,10 @@ Still open: which CBV index lands in which pair. The four pairs do appear in dec
+ package proves that order, and every parameter in these 29 is `D3D12_SHADER_VISIBILITY_ALL`, so they say nothing
+ about the visibility question below.
+ 
+-Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
+-refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
+-`__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
++Spill policy: graphics signatures (`pack()` and non-compute `pack_stage`) needing more than 32 user SGPRs, and any
++signature exceeding the 64-dword D3D12 cost limit, are refused loudly (`pack` returns the offending parameter) instead
++of being truncated. Compute signatures spill trailing parameters past `s31` into the `s[0:1]` packed spill array
++(section 7).
+ 
+ Measured (D3D-315): zero below-base spill-pointer candidates in the translated shaders.
+ `python -I tools/root_spill_census.py <spirv/index.json> --carve <dxbc/index.json> --expect-no-spill` exits 0 on
+diff --git a/runtime/shims/d3d12_com.cpp b/runtime/shims/d3d12_com.cpp
+index e33769c580..58de377bae 100644
+--- a/runtime/shims/d3d12_com.cpp
++++ b/runtime/shims/d3d12_com.cpp
+@@ -842,6 +842,7 @@ class GraphicsCommandList final
+             if (!compute_pipeline_ || !compute_.layout) return check(false);
+             cmd.pipeline = compute_pipeline_;
+             cmd.user_data = compute_.data;
++            cmd.spill_data = compute_.spill;
+         }
+         check(list_.execute_indirect(cmd));
+     }
+@@ -1086,6 +1087,7 @@ class GraphicsCommandList final
+     struct RootState {
+         const RootArgumentLayout* layout = nullptr;
+         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
++        std::vector<std::uint32_t> spill;
+     };
+ 
+     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
+@@ -1101,6 +1103,7 @@ class GraphicsCommandList final
+         hold(signature);  // state.layout points into it
+         state.layout = layout;
+         state.data = {};
++        state.spill.assign((is_compute(state) && layout && layout->compute_ok) ? layout->compute_spill_dwords : 0, 0);
+         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
+         // CreateRootSignature accepted it for the other bind point only (its log line says why).
+         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
+@@ -1127,7 +1130,8 @@ class GraphicsCommandList final
+         return &state.layout->parameters[index];
+     }
+ 
+-    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
++    // Dwords beyond the 32 user registers are what the console spills to memory; graphics keeps stubbing until its
++    // spill pointer SGPR is measured, while compute writes into state.spill for the s[0:1] array.
+     void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
+         if (dword < rt::rootsig::kMaxUserSgprs)
+             state.data[dword] = value;
+@@ -1135,6 +1139,13 @@ class GraphicsCommandList final
+             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+     }
+ 
++    void write_spill(RootState& state, std::uint32_t dword, std::uint32_t value) {
++        if (dword < state.spill.size())
++            state.spill[dword] = value;
++        else
++            check(false);
++    }
++
+     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+             // The layout is the executing list's, so the range is checked when it runs; no signature takes more
+@@ -1156,7 +1167,13 @@ class GraphicsCommandList final
+         if (!p) return;
+         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
+         const auto* values = static_cast<const std::uint32_t*>(data);
++        if (is_compute(state) && p->compute_offset == rt::rootsig::kNoSgpr) {
++            if (p->compute_spill_offset == rt::rootsig::kNoSpill) return check(false);
++            for (UINT i = 0; i < count; ++i) write_spill(state, p->compute_spill_offset + offset + i, values[i]);
++            return;
++        }
+         const std::uint32_t first = first_dword(state, *p);
++        if (first == UINT32_MAX) return check(false);
+         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
+     }
+ 
+@@ -1167,7 +1184,15 @@ class GraphicsCommandList final
+             return;
+         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
+         if (!p) return;
++        if (is_compute(state) && p->compute_offset == rt::rootsig::kNoSgpr) {
++            if (p->compute_spill_offset == rt::rootsig::kNoSpill) return check(false);
++            write_spill(state, p->compute_spill_offset, std::uint32_t(va));
++            if (type != rt::rootsig::ParamType::Table)
++                write_spill(state, p->compute_spill_offset + 1, std::uint32_t(va >> 32));
++            return;
++        }
+         const std::uint32_t first = first_dword(state, *p);
++        if (first == UINT32_MAX) return check(false);
+         write(state, first, std::uint32_t(va));
+         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
+         // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
+@@ -1319,7 +1344,7 @@ class GraphicsCommandList final
+     void record_dispatch(UINT x, UINT y, UINT z) {
+         if (!compute_pipeline_ || !compute_.layout) return check(false);
+         note_direct_heap_indexing(compute_.layout);
+-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
++        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z, compute_.spill}));
+     }
+ 
+     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
+diff --git a/runtime/shims/d3d12_com.h b/runtime/shims/d3d12_com.h
+index 8f37b1ff24..163f41b1d3 100644
+--- a/runtime/shims/d3d12_com.h
++++ b/runtime/shims/d3d12_com.h
+@@ -363,9 +363,11 @@ struct RootArgumentLayout {
+         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
+         std::uint32_t constant_count;  // constants only
+         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
++        std::uint32_t compute_spill_offset = rt::rootsig::kNoSpill;  // compute: dword offset in s[0:1] spill array
+     };
+     std::vector<Parameter> parameters;
+     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
++    std::uint32_t compute_spill_dwords = 0;
+     bool graphics_ok = true;
+     bool compute_ok = true;
+ };
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 176ab613c4..df7ed645e6 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -5183,6 +5183,22 @@ class Device final
+         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
+         state_.context->set_heap_base(arena.address);
+         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
++        state_.context->set_root_spill_stager(
++            [this](const void* data, std::size_t bytes, std::uint64_t& console_va, std::shared_ptr<void>& hold) -> bool {
++                if (!data || !bytes || !state_.arena.mapped) return false;
++                VkDeviceSize offset = 0;
++                if (!state_.arena_allocate(bytes, 16, offset, DeviceState::arena_buffer)) {
++                    log_once("GPU address arena full (raise LEONIDA_ARENA_MB); compute spill size in bytes:",
++                             int(std::min<std::size_t>(bytes, INT_MAX)));
++                    return false;
++                }
++                std::memcpy(state_.arena.mapped + offset, data, bytes);
++                console_va = offset;
++                hold = std::shared_ptr<void>(state_.arena.mapped + offset, [this, offset, bytes](void*) {
++                    state_.arena_release(offset, bytes, DeviceState::arena_buffer);
++                });
++                return true;
++            });
+         return true;
+     }
+ 
+@@ -5193,6 +5209,7 @@ class Device final
+                 state_.context->vk.vkDeviceWaitIdle(state_.info.device);
+             }
+             state_.context->drain_deleted_resources(UINT64_MAX);
++            state_.context->set_root_spill_stager(nullptr);
+             state_.context->set_bindless_release(nullptr, nullptr);
+             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
+         }
+@@ -5748,6 +5765,7 @@ class Device final
+         layout.flags = parsed.sig.flags;
+         layout.graphics_ok = packed.ok;
+         layout.compute_ok = compute.ok;
++        layout.compute_spill_dwords = compute.ok ? compute.spill_dwords : 0;
+         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+             std::uint32_t first = UINT32_MAX;
+             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
+@@ -5756,7 +5774,8 @@ class Device final
+                     break;
+                 }
+             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
++                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
++                                         compute.ok ? compute.spill_dword[i] : rt::rootsig::kNoSpill});
+         }
+         register_static_samplers(parsed.sig);
+         auto* signature = new RootSignature(
+diff --git a/runtime/src/command_list.h b/runtime/src/command_list.h
+index 4b384bdc16..58f9489e88 100644
+--- a/runtime/src/command_list.h
++++ b/runtime/src/command_list.h
+@@ -373,13 +373,15 @@ struct ResolveSubresource {
+ };
+ 
+ // Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
+-// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
++// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5), plus any
++// spilled compute root arguments packed for the array behind s[0:1].
+ struct Dispatch {
+     std::uintptr_t pipeline;
+     std::array<std::uint32_t, 32> user_data;
+     std::uint32_t x;
+     std::uint32_t y;
+     std::uint32_t z;
++    std::vector<std::uint32_t> spill_data;
+ };
+ 
+ // D3D12_VIEWPORT.
+@@ -601,6 +603,7 @@ struct ExecuteIndirect {
+     // as it is.
+     std::uintptr_t pipeline = 0;
+     std::array<std::uint32_t, 32> user_data{};
++    std::vector<std::uint32_t> spill_data;
+ };
+ 
+ // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
+diff --git a/runtime/src/root_signature.cpp b/runtime/src/root_signature.cpp
+index a0eb96cced..10dd1e02c7 100644
+--- a/runtime/src/root_signature.cpp
++++ b/runtime/src/root_signature.cpp
+@@ -59,10 +59,18 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
+     }
+     uint64_t cost = 0;  // 64-bit, as in pack()
+     uint64_t next = out.base;
++    uint64_t spill_next = 0;
++    bool spilling = false;
+     std::vector<uint32_t> first;
++    std::vector<uint32_t> spill;
+     first.reserve(sig.params.size());
++    spill.reserve(sig.params.size());
+     for (size_t i = 0; i < sig.params.size(); ++i) {
+         const RootParameter& p = sig.params[i];
++        if (p.type != ParamType::Constants && p.type != ParamType::Descriptor && p.type != ParamType::Table) {
++            out.error = "unknown root parameter type";
++            return out;
++        }
+         if (p.type == ParamType::Constants && p.num_values == 0) {
+             out.error = "root constant parameter needs at least 1 dword";
+             return out;
+@@ -73,18 +81,27 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
+             return out;
+         }
+         const uint64_t dwords = stage_dwords(p.type, p.num_values);
+-        if (next + dwords > kMaxUserSgprs) {
+-            // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's
+-            // layout is not modelled here, so refuse rather than drop arguments.
++        if (!spilling && next + dwords <= kMaxUserSgprs) {
++            first.push_back(static_cast<uint32_t>(next));
++            spill.push_back(kNoSpill);
++            next += dwords;
++        } else if (stage == Stage::Compute) {
++            // Compute packs this parameter and every later one contiguously into the spill array behind s[0:1]
++            // (docs/d3d12_vulkan.md §3.5 & §7). Total spill stays bounded by kMaxD3d12Cost (<= 64 dwords).
++            spilling = true;
++            first.push_back(kNoSgpr);
++            spill.push_back(static_cast<uint32_t>(spill_next));
++            spill_next += dwords;
++        } else {
+             out.error = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
+                         std::to_string(out.base) + " (spill array not modelled)";
+             return out;
+         }
+-        first.push_back(static_cast<uint32_t>(next));
+-        next += dwords;
+     }
+     out.first_sgpr = std::move(first);
++    out.spill_dword = std::move(spill);
+     out.end_sgpr = static_cast<uint32_t>(next);
++    out.spill_dwords = static_cast<uint32_t>(spill_next);
+     out.d3d12_cost = static_cast<uint32_t>(cost);
+     out.ok = true;
+     return out;
+diff --git a/runtime/src/root_signature.h b/runtime/src/root_signature.h
+index 3769629400..60b0d56327 100644
+--- a/runtime/src/root_signature.h
++++ b/runtime/src/root_signature.h
+@@ -132,7 +132,9 @@ constexpr uint32_t kMaxD3d12Cost = 64;
+ //   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
+ //     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
+ // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
+-// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
++// every parameter after it. For compute that packed spill array (1 dword per 32-bit constant, 2 per root descriptor,
++// 1 per descriptor table, no alignment padding) is modelled in StagePackResult; non-compute stages still refuse spills
++// because their spill pointer SGPR is unmeasured.
+ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
+ 
+ [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
+@@ -163,19 +165,23 @@ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3,
+ }
+ 
+ constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
++constexpr uint32_t kNoSpill = 0xFFFFFFFFu;
+ 
+ struct StagePackResult {
+     bool ok = false;
+-    std::string error;            // set when !ok; names the refusing parameter
++    std::string error;                 // set when !ok; names the refusing parameter
+     Stage stage = Stage::Compute;
+-    uint32_t base = 0;            // stage_base(stage)
+-    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
+-    uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
+-    uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
++    uint32_t base = 0;                 // stage_base(stage)
++    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when spilled or refused)
++    std::vector<uint32_t> spill_dword; // per parameter: dword offset in s[0:1] spill array (kNoSpill when inline)
++    uint32_t end_sgpr = 0;             // one past the last inline SGPR used: the RSRC2 USER_SGPR count
++    uint32_t spill_dwords = 0;         // total dwords in the packed spill array (0 when nothing spills)
++    uint32_t d3d12_cost = 0;           // cost against the 64-dword D3D12 limit
+ };
+ 
+-// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, a
+-// constant parameter of 0 values or the 64-dword cost limit, and on any parameter that would spill.
++// Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, an
++// unknown parameter type, a constant parameter of 0 values, or the 64-dword cost limit. Compute spills any trailing
++// parameters from the first one that does not fit whole into spill_dword; non-compute stages refuse any spill.
+ [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
+ 
+ // D3D12 cost of one parameter against the 64-dword limit.
+diff --git a/runtime/src/vulkan_backend.h b/runtime/src/vulkan_backend.h
+index e659a762dc..9b70ff0b36 100644
+--- a/runtime/src/vulkan_backend.h
++++ b/runtime/src/vulkan_backend.h
+@@ -1247,6 +1247,14 @@ class VulkanContext {
+         replay_.zero_size = size;
+     }
+ 
++    // Stages packed compute root-signature spill buffers in the GPU address arena for the duration of a submission.
++    using RootSpillStager =
++        std::function<bool(const void* data, std::size_t bytes, std::uint64_t& console_va, std::shared_ptr<void>& hold)>;
++    void set_root_spill_stager(RootSpillStager stager) {
++        std::unique_lock lock(resource_mutex_);
++        root_spill_stager_ = std::move(stager);
++    }
++
+     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
+     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
+         std::unique_lock lock(resource_mutex_);
+@@ -1682,6 +1690,7 @@ class VulkanContext {
+     bool order_timestamp_copies_ = false;
+     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
+     ReplayFunctions replay_;
++    RootSpillStager root_spill_stager_;
+     std::unique_ptr<PredicateReducer> predicate_reducer_;
+     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
+     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
+@@ -2166,6 +2175,7 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
+             std::vector<KhrInstanceStage> stages;
+             ~KhrGuard() { queue->recycle_khr_stages(stages); }
+         } khr_guard{this};
++        std::vector<std::shared_ptr<void>> spill_holds;
+         std::function<void(bool)> bindless_commit;
+         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
+@@ -2208,6 +2218,17 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
+                                                                    VkDeviceAddress& address) {
+             return stage_khr_instances(replay, build, khr_guard.stages, address);
+         };
++        if (context_.root_spill_stager_) {
++            replay.stage_root_spill = [this, &spill_holds](const std::uint32_t* dwords, std::size_t count,
++                                                           std::uint64_t& console_va) {
++                if (!dwords || !count) return false;
++                std::shared_ptr<void> hold;
++                if (!context_.root_spill_stager_(dwords, count * sizeof(std::uint32_t), console_va, hold))
++                    return false;
++                if (hold) spill_holds.push_back(std::move(hold));
++                return true;
++            };
++        }
+         std::uint64_t captures = 0;
+         for (const auto* list : lists)
+             for (const auto& command : list->commands())
+@@ -2379,6 +2400,8 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
+         if (!slot) return ReplayResult::unsupported;
+         slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
+         khr_guard.stages.clear();
++        slot->root_spills = std::move(spill_holds);         // freed when this slot completes
++        spill_holds.clear();
+         command_buffer = slot->buffer;
+         // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
+         // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
+@@ -2399,6 +2422,7 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
+                 ordered_timestamps = true;
+             };
+         const auto discard = [&] {
++            slot->root_spills.clear();
+             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
+         };
+         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+@@ -2787,6 +2811,7 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
+         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
+         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
+         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
++        std::vector<std::shared_ptr<void>> root_spills;  // compute spill-array arena holds, same lifetime
+     };
+ 
+     struct PendingBindings {
+@@ -2948,6 +2973,7 @@ class VulkanQueue : private QueueHolds<VkSemaphore>::Holder {
+             if (slot.ticket > done) continue;
+             slot.segments.clear();
+             recycle_khr_stages(slot.khr_instances);
++            slot.root_spills.clear();
+             for (VkEvent event : slot.events)
+                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
+                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index 1e0e598c7f..e00ae04363 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -901,6 +901,9 @@ struct ReplayFunctions {
+     // device addresses, not console VAs. This stages one that stays alive until the submission completes and returns
+     // its device address. A GPU-written list is refused as unsupported; a bad entry is invalid_copy.
+     std::function<ReplayResult(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
++    // Stages a packed compute root-signature spill array in the GPU address arena for the lifetime of this
++    // submission and returns its console VA (offset in the arena, bound via s[0:1]).
++    std::function<bool(const std::uint32_t* dwords, std::size_t count, std::uint64_t& console_va)> stage_root_spill;
+     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
+     // cannot read while the list is prepared, `xdxr_record` records the build.
+     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
+@@ -1020,6 +1023,7 @@ struct Prepared {
+     VkDeviceSize fill_scratch_offset = 0;
+     QueryPool* queries = nullptr;  // query commands: the heap
+     ComputePipeline pipeline;  // dispatches
++    std::uint64_t spill_va = 0;  // staged compute root spill array console VA (s[0:1]); 0 when none
+     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
+     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
+     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
+@@ -3028,6 +3032,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
+                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                 p.pipeline = *pipeline;
++                if (!ind->spill_data.empty()) {
++                    if (!vk.stage_root_spill ||
++                        !vk.stage_root_spill(ind->spill_data.data(), ind->spill_data.size(), p.spill_va))
++                        return ReplayResult::unsupported;
++                }
+             }
+         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
+             p.khr_instances = 0;
+@@ -3077,6 +3086,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
+             if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+             p.pipeline = *pipeline;
++            if (!dispatch->spill_data.empty()) {
++                if (!vk.stage_root_spill ||
++                    !vk.stage_root_spill(dispatch->spill_data.data(), dispatch->spill_data.size(), p.spill_va))
++                    return ReplayResult::unsupported;
++            }
+         } else if (const auto* draw = std::get_if<Draw>(&command)) {
+             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
+             auto& prepared_draw = out.draws[out.draw_count];
+@@ -3929,6 +3943,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+                     if (ind->pipeline) {
+                         ShaderUserData data{};
+                         std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
++                        if (p.spill_va != 0) {
++                            data.s[0] = static_cast<std::uint32_t>(p.spill_va);
++                            data.s[1] = static_cast<std::uint32_t>(p.spill_va >> 32);
++                        }
+                         data.heap_base = vk.heap_base;
+                         data.code_base = p.pipeline.code_base;
+                         vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+@@ -4014,6 +4032,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+             ShaderUserData data{};
+             std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
++            if (p.spill_va != 0) {
++                data.s[0] = static_cast<std::uint32_t>(p.spill_va);
++                data.s[1] = static_cast<std::uint32_t>(p.spill_va >> 32);
++            }
+             data.heap_base = vk.heap_base;
+             data.code_base = p.pipeline.code_base;
+             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
+diff --git a/runtime/test/d3d12_compute_test.cpp b/runtime/test/d3d12_compute_test.cpp
+index 5ba3ded525..65565a9fa6 100644
+--- a/runtime/test/d3d12_compute_test.cpp
++++ b/runtime/test/d3d12_compute_test.cpp
+@@ -306,6 +306,7 @@ int main() {
+     std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
+     std::vector<std::uint32_t> srv_raw_a(elements), srv_raw_b(elements), srv_struct_a(elements),
+         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
++    std::vector<std::uint32_t> spill_first(elements), spill_second(elements);
+     {
+         rt::d3d12::VulkanDeviceInfo info{};
+         info.get_instance_proc = d.instance_proc;
+@@ -939,6 +940,86 @@ int main() {
+             std::memcpy(srv_null.data(), rb + 5 * bytes, bytes);
+         }
+ 
++        // Compute root-signature spill array (s[0:1]): [0] 27 constants (s4..s30), [1] root UAV (spill 0..1),
++        // [2] 1-CBV table (spill 2, verifying monotonic spill with s31 still unused), [3] 2 constants (spill 3..4).
++        {
++            D3D12_DESCRIPTOR_RANGE spill_range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
++            D3D12_ROOT_PARAMETER spill_params[4] = {};
++            spill_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++            spill_params[0].Constants = {0, 0, 27};
++            spill_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
++            spill_params[1].Descriptor = {0, 0};
++            spill_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++            spill_params[2].DescriptorTable = {1, &spill_range};
++            spill_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++            spill_params[3].Constants = {2, 0, 2};
++            D3D12_VERSIONED_ROOT_SIGNATURE_DESC spill_desc{};
++            spill_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
++            spill_desc.Desc_1_0 = {4, spill_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
++            const auto spill_blob = serialize(spill_desc);
++            EXPECT(!spill_blob.empty());
++
++            Ref<ID3D12RootSignature> spill_root;
++            EXPECT(SUCCEEDED(
++                device->CreateRootSignature(0, spill_blob.data(), spill_blob.size(), IID_PPV_ARGS(&spill_root.p))));
++            D3D12_COMPUTE_PIPELINE_STATE_DESC spill_pso_desc{};
++            spill_pso_desc.pRootSignature = spill_root.p;
++            spill_pso_desc.CS = {container.data(), container.size()};
++            Ref<ID3D12PipelineState> spill_pso;
++            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&spill_pso_desc, IID_PPV_ARGS(&spill_pso.p))));
++
++            Ref<ID3D12Resource> spill_readback;
++            const auto spill_rb_desc = buffer_desc(2 * bytes, D3D12_RESOURCE_FLAG_NONE);
++            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &spill_rb_desc,
++                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                                             IID_PPV_ARGS(&spill_readback.p))));
++
++            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, spill_pso.p)));
++            // out_b ended the earlier dispatch pass in COPY_SOURCE; restore it to UNORDERED_ACCESS before writing.
++            const auto b_to_uav =
++                transition(out_b.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++            list->ResourceBarrier(1, &b_to_uav);
++            list->SetDescriptorHeaps(1, heaps);
++            list->SetComputeRootSignature(spill_root.p);
++            list->SetComputeRoot32BitConstant(0, 11u, 0);   // s4
++            list->SetComputeRoot32BitConstant(0, 29u, 26);  // s30
++            list->SetComputeRootUnorderedAccessView(1, va_a);
++            list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
++            const std::uint32_t spill_c1[2] = {100u, 7u};
++            list->SetComputeRoot32BitConstants(3, 2, spill_c1, 0);
++            list->Dispatch(1, 1, 1);
++
++            // Second dispatch updates spilled parameters on the same command list: must stage an isolated spill slice.
++            list->SetComputeRootUnorderedAccessView(1, va_b);
++            const std::uint32_t spill_c2[2] = {500u, 13u};
++            list->SetComputeRoot32BitConstants(3, 2, spill_c2, 0);
++            list->Dispatch(1, 1, 1);
++
++            D3D12_RESOURCE_BARRIER spill_barriers[2] = {
++                transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
++                transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
++            list->ResourceBarrier(2, spill_barriers);
++            list->CopyBufferRegion(spill_readback.p, 0, out_a.p, 0, bytes);
++            list->CopyBufferRegion(spill_readback.p, bytes, out_b.p, 0, bytes);
++            EXPECT(list->Close() == S_OK);
++            queue->ExecuteCommandLists(1, lists);
++            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
++            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)));
++            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
++
++            void* spill_res = nullptr;
++            EXPECT(SUCCEEDED(spill_readback->Map(0, nullptr, &spill_res)));
++            std::memcpy(spill_first.data(), spill_res, bytes);
++            std::memcpy(spill_second.data(), static_cast<const std::uint8_t*>(spill_res) + bytes, bytes);
++
++            // Binding the compute-only spilling signature on graphics must still invalidate the list without
++            // wrapping unplaced parameter offsets (UINT32_MAX) into s0..s31.
++            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
++            list->SetGraphicsRootSignature(spill_root.p);
++            list->SetGraphicsRoot32BitConstants(3, 2, spill_c1, 0);
++            EXPECT(list->Close() == E_INVALIDARG);
++        }
++
+         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
+         pso67.reset();
+         unknown67.reset();
+@@ -1016,6 +1097,16 @@ int main() {
+                 "typed (24 + 40 OOB-zero) matched; negative controls flipped %u/32 (raw B), %u/32 (struct B), %u/32 "
+                 "(null)\n",
+                 raw_diff, struct_diff, null_diff);
++    for (std::uint32_t i = 0; i < elements; ++i) {
++        const std::uint32_t want_1 = 11u + 29u + 100u + 7u * i + table_values[i % 4u];
++        const std::uint32_t want_2 = 11u + 29u + 500u + 13u * i + table_values[i % 4u];
++        if ((spill_first[i] != want_1 || spill_second[i] != want_2) && mismatches++ < 4)
++            std::fprintf(stderr, "spill element %u: got %u and %u, want %u and %u\n", i, spill_first[i],
++                         spill_second[i], want_1, want_2);
++    }
++    EXPECT(!mismatches);
++    std::printf("compute root spill (s[0:1]): %u/%u elements matched across two isolated dispatches\n", elements,
++                elements);
+     if (d.validation_errors()) {
+         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+         return 1;
+diff --git a/runtime/test/glsl/cs_user_data.comp b/runtime/test/glsl/cs_user_data.comp
+index b285c0f3f9..a3b8734d2e 100644
+--- a/runtime/test/glsl/cs_user_data.comp
++++ b/runtime/test/glsl/cs_user_data.comp
+@@ -37,6 +37,15 @@ Words at(uvec2 va) {
+ 
+ void main() {
+     const uint i = gl_GlobalInvocationID.x;
++    if (pc.s[0] != 0u || pc.s[1] != 0u) {
++        // Compute root-signature spill array path: s[0:1] holds the console VA of packed spilled arguments.
++        Words spill = at(uvec2(pc.s[0], pc.s[1]));
++        Words out_buf = at(uvec2(spill.w[0], spill.w[1]));
++        Words tbl = at(uvec2(spill.w[2], 0u));
++        Words tbl_data = at(uvec2(tbl.w[0], tbl.w[1]));
++        out_buf.w[i] = pc.s[4] + pc.s[30] + spill.w[3] + spill.w[4] * i + tbl_data.w[i % 4u];
++        return;
++    }
+     Words table = at(uvec2(pc.s[8], 0u));
+     Words result = at(uvec2(pc.s[6], pc.s[7]));
+     if (pc.s[5] == 0u) {
+diff --git a/runtime/test/root_signature_test.cpp b/runtime/test/root_signature_test.cpp
+index 831739a8c3..169c656f90 100644
+--- a/runtime/test/root_signature_test.cpp
++++ b/runtime/test/root_signature_test.cpp
+@@ -421,24 +421,61 @@ int main() {
+ 
+         // An empty signature is valid and uses nothing.
+         const StagePackResult empty = pack_stage(RootSignature{}, Stage::Compute);
+-        check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
++        check(empty.ok && empty.first_sgpr.empty() && empty.spill_dword.empty() && empty.end_sgpr == 4 &&
++                  empty.spill_dwords == 0,
++              "pack_stage: empty signature");
+     }
+ 
+-    // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
++    // Compute spills parameters from the first one that does not fit whole from s4..s31 into the packed spill array
++    // (s[0:1]); non-compute stages still refuse spills. Compute budget is 28 inline SGPRs above s4, mesh 16 above s16.
+     {
+         RootSignature exact;
+         exact.params = {consts(28)};
+-        check(pack_stage(exact, Stage::Compute).ok, "pack_stage: 28 constants fill compute exactly");
++        const StagePackResult exact_r = pack_stage(exact, Stage::Compute);
++        check(exact_r.ok && exact_r.end_sgpr == 32 && exact_r.spill_dwords == 0 &&
++                  exact_r.spill_dword == std::vector<uint32_t>({kNoSpill}),
++              "pack_stage: 28 constants fill compute inline SGPRs with no spill");
++
+         RootSignature over;
+-        over.params = {consts(27), view()};  // the view would need s31..s32
++        over.params = {consts(27), view()};  // the view would need s31..s32, so it spills
+         const StagePackResult r = pack_stage(over, Stage::Compute);
+-        check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
+-                  r.error.find("spill") != std::string::npos,
+-              "pack_stage: a parameter that does not fit whole is refused and named");
++        check(r.ok && r.first_sgpr == std::vector<uint32_t>({4, kNoSgpr}) &&
++                  r.spill_dword == std::vector<uint32_t>({kNoSpill, 0}) && r.end_sgpr == 31 && r.spill_dwords == 2,
++              "pack_stage: compute parameter that does not fit whole spills at offset 0");
++
+         RootSignature fits_old;
+-        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
+-        check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
+-              "pack_stage: compute budget is 28, not 32");
++        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, spills on compute from s4
++        const StagePackResult cs_fits = pack_stage(fits_old, Stage::Compute);
++        check(pack(fits_old).ok && cs_fits.ok && cs_fits.first_sgpr == std::vector<uint32_t>({kNoSgpr}) &&
++                  cs_fits.spill_dword == std::vector<uint32_t>({0}) && cs_fits.end_sgpr == 4 &&
++                  cs_fits.spill_dwords == 30,
++              "pack_stage: compute inline budget is 28 from s4; 30 constants spill all 30 dwords");
++
++        // Mixed spill without alignment padding: table (1), root view (2), constants (3) pack at 0, 1, 3.
++        RootSignature mixed_spill;
++        mixed_spill.params = {consts(26), view(), table(), view(), consts(3)};
++        const StagePackResult ms = pack_stage(mixed_spill, Stage::Compute);
++        check(ms.ok && ms.first_sgpr == std::vector<uint32_t>({4, 30, kNoSgpr, kNoSgpr, kNoSgpr}) &&
++                  ms.spill_dword == std::vector<uint32_t>({kNoSpill, kNoSpill, 0, 1, 3}) && ms.end_sgpr == 32 &&
++                  ms.spill_dwords == 6,
++              "pack_stage: compute spill packs mixed table, unaligned root view, and constants contiguously");
++
++        // Once one parameter spills, every subsequent parameter spills even if a later 1-dword table would fit in s31.
++        RootSignature monotonic;
++        monotonic.params = {consts(27), view(), table()};
++        const StagePackResult mr = pack_stage(monotonic, Stage::Compute);
++        check(mr.ok && mr.first_sgpr == std::vector<uint32_t>({4, kNoSgpr, kNoSgpr}) &&
++                  mr.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 2}) && mr.end_sgpr == 31 &&
++                  mr.spill_dwords == 3,
++              "pack_stage: first spilling parameter sends every subsequent parameter to the spill array");
++
++        // 64-dword D3D12 cost still holds for spilling compute signatures.
++        RootSignature max64;
++        max64.params = {consts(64)};
++        const StagePackResult m64 = pack_stage(max64, Stage::Compute);
++        check(m64.ok && m64.end_sgpr == 4 && m64.spill_dwords == 64 && m64.d3d12_cost == 64,
++              "pack_stage: 64-dword spilled compute signature accepted");
++
+         RootSignature tables;
+         tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
+         check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
+@@ -446,19 +483,30 @@ int main() {
+         tables.params.assign(16, table());  // fills mesh s16..s31 exactly
+         check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
+         tables.params.push_back(table());
+-        check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
++        const StagePackResult mesh_spill = pack_stage(tables, Stage::Mesh);
++        check(!mesh_spill.ok && mesh_spill.first_sgpr.empty() &&
++                  mesh_spill.error.find("root parameter 16") != std::string::npos &&
++                  mesh_spill.error.find("spill") != std::string::npos,
++              "pack_stage: a 17th table still refuses to spill on mesh");
++        check(!pack_stage(over, Stage::Pixel).ok && !pack_stage(over, Stage::Vertex).ok,
++              "pack_stage: non-compute graphics stages still refuse spills");
+     }
+ 
+     // pack_stage keeps pack()'s validation.
+     {
++        RootSignature invalid_sig;
++        RootParameter bad_param;
++        bad_param.type = static_cast<ParamType>(0xffffffffu);
++        invalid_sig.params = {bad_param};
++        check(!pack_stage(invalid_sig, Stage::Compute).ok, "pack_stage: invalid parameter enum rejected");
+         RootSignature zero;
+         zero.params = {consts(0)};
+         check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
+-        // Every parameter takes at least as many SGPRs as it costs, so the 32-SGPR budget refuses before the
+-        // 64-dword cost limit can; an over-cost signature is refused all the same.
+         RootSignature costly;
+-        costly.params = {consts(40), consts(30)};
+-        check(!pack_stage(costly, Stage::Compute).ok, "pack_stage: over-cost signature refused");
++        costly.params = {consts(32), consts(33)};
++        const StagePackResult costly_r = pack_stage(costly, Stage::Compute);
++        check(!costly_r.ok && costly_r.error.find("64-dword") != std::string::npos,
++              "pack_stage: over-cost signature refused even when compute spills");
+         RootSignature many;
+         many.params.assign(65, table());
+         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
